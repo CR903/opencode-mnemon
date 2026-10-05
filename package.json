@@ -1,0 +1,44 @@
+{
+	"name": "opencode-mnemon-plugin",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "OpenCode plugin: project-scoped automatic memory via mnemon CLI (runtime capture, rule + LLM extraction, recall/status injection)",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+ssh://git@github.com/CR903/opencode-mnemon-plugin.git"
+	},
+	"bugs": {
+		"url": "https://github.com/CR903/opencode-mnemon-plugin/issues"
+	},
+	"homepage": "https://github.com/CR903/opencode-mnemon-plugin#readme",
+	"keywords": [
+		"opencode",
+		"opencode-plugin",
+		"plugin",
+		"mnemon",
+		"memory",
+		"recall"
+	],
+	"main": "./mnemon.js",
+	"exports": {
+		".": "./mnemon.js"
+	},
+	"files": [
+		"mnemon.js",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test:build": "sh tests/build-mnemon-test.sh",
+		"test": "sh tests/build-mnemon-test.sh && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
+		"test:deploy": "sh tests/build-mnemon-test.sh \"$PWD/mnemon.js\" && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
+		"deploy": "node scripts/deploy.mjs",
+		"version:patch": "npm version patch",
+		"version:minor": "npm version minor",
+		"version:major": "npm version major"
+	},
+	"dependencies": {
+		"@opencode/plugin": ">=2.0.0"
+	}
+}
