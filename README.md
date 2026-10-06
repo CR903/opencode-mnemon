@@ -124,4 +124,15 @@ All of the above was found by probing, not reading docs.
 
 ## Documentation
 
-`docs/prd.md`, `docs/design.md`, `docs/implement.md` hold the requirements, technical design, and the 8-step execution record with verification evidence. They are a snapshot copied from the Trellis task directory at `.trellis/tasks/10-04-opencode-mnemon-auto-memory/` — that directory remains the working copy.
+`docs/prd.md`, `docs/design.md`, `docs/implement.md` hold the requirements, technical design, and the 8-step execution record with verification evidence. The Trellis task directory at `~/project/others/.trellis/tasks/10-04-opencode-mnemon-auto-memory/` is the working copy; `docs/` is a one-way snapshot of it, kept in git because that task directory is not version controlled anywhere.
+
+Edit the task documents, then sync:
+
+```
+npm run sync:docs          # copy prd/design/implement into docs/
+npm run sync:docs:check    # report drift only; non-zero exit on drift
+```
+
+`npm test` runs the check, so a stale snapshot fails the suite. Override the source with `MNEMON_TASK_DIR=...` or a positional path. If the task directory is absent, the check exits clean rather than failing — there is nothing to compare against. `docs/` is derived: never edit it directly, your changes will be overwritten on the next sync.
+
+Not covered by the sync: `tests/`. `build-mnemon-test.sh` has legitimately diverged (the repo copy is newer — it accepts `MNEMON_PLUGIN_PATH` and a path argument, while the task directory copy still hardcodes the live deployment path), so it is reconciled by hand.
