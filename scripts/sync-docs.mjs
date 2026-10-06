@@ -17,9 +17,12 @@
 // failure rather than exiting clean. Set MNEMON_TASK_DIR_OPTIONAL=1 to opt out
 // on a machine that genuinely has no Trellis task directory.
 //
-// Not covered: tests/. build-mnemon-test.sh has legitimately diverged (the
-// repo copy is newer), so a blanket sync would overwrite it. Reconcile that
-// pair by hand, then decide its canonical side.
+// Not covered: tests/. Those are live code here, not a snapshot, so they are
+// never synced from the task directory. build-mnemon-test.sh differs from the
+// archived copy on purpose: the repo version accepts MNEMON_PLUGIN_PATH/$1 and
+// validates the source. The archived copy is frozen history of that task and is
+// deliberately left alone -- rewriting it would misrepresent what the task
+// produced.
 
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs"
 import { homedir } from "node:os"

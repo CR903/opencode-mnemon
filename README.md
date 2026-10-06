@@ -143,4 +143,4 @@ The script finds the task directory whether it is still active (`tasks/<slug>/`)
 MNEMON_TASK_DIR_OPTIONAL=1 npm test
 ```
 
-Not covered by the sync: `tests/`. `build-mnemon-test.sh` has legitimately diverged (the repo copy is newer — it accepts `MNEMON_PLUGIN_PATH` and a path argument, while the task directory copy still hardcodes the live deployment path), so it is reconciled by hand.
+Not covered by the sync: `tests/`. Those are live code here, not a snapshot, so they are never written from the task directory. `build-mnemon-test.sh` intentionally differs from the archived copy — the repo version accepts `MNEMON_PLUGIN_PATH` and a path argument and validates the source exists, while the archived one hardcodes the live deployment path. The archived copy stays as it is: it is the frozen record of what that task produced, and rewriting it would misrepresent that.
