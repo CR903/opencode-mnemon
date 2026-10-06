@@ -6,12 +6,12 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+ssh://git@github.com/CR903/opencode-mnemon-plugin.git"
+		"url": "git+ssh://git@github.com/CR903/opencode-mnemon.git"
 	},
 	"bugs": {
-		"url": "https://github.com/CR903/opencode-mnemon-plugin/issues"
+		"url": "https://github.com/CR903/opencode-mnemon/issues"
 	},
-	"homepage": "https://github.com/CR903/opencode-mnemon-plugin#readme",
+	"homepage": "https://github.com/CR903/opencode-mnemon#readme",
 	"keywords": [
 		"opencode",
 		"opencode-plugin",

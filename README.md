@@ -1,4 +1,4 @@
-# opencode-mnemon-plugin
+# opencode-mnemon
 
 OpenCode plugin for **project-scoped automatic memory** on top of the [mnemon](https://github.com/dsh) CLI.
 
@@ -37,7 +37,7 @@ These are load-bearing. Breaking them corrupts shared state.
 One real file, symlinked into the OpenCode plugin slot — so editing the repo edits what OpenCode loads and nothing can drift.
 
 ```sh
-npm run deploy            # ~/.config/opencode/plugins/mnemon.js -> ../opencode-mnemon-plugin/mnemon.js
+npm run deploy            # ~/.config/opencode/plugins/mnemon.js -> ../opencode-mnemon/mnemon.js
 npm run deploy -- --copy  # force a real copy instead
 ```
 
