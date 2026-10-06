@@ -133,6 +133,14 @@ npm run sync:docs          # copy prd/design/implement into docs/
 npm run sync:docs:check    # report drift only; non-zero exit on drift
 ```
 
-`npm test` runs the check, so a stale snapshot fails the suite. Override the source with `MNEMON_TASK_DIR=...` or a positional path. If the task directory is absent, the check exits clean rather than failing — there is nothing to compare against. `docs/` is derived: never edit it directly, your changes will be overwritten on the next sync.
+`npm test` runs the check, so a stale snapshot fails the suite. `docs/` is derived: never edit it directly, your changes will be overwritten on the next sync.
+
+The script finds the task directory whether it is still active (`tasks/<slug>/`) or already archived (`tasks/archive/<YYYY-MM>/<slug>/`) — archiving moves it, and an archived task is still the source of record. Override with `MNEMON_TASK_DIR=...` or a positional path.
+
+**If no task directory is found, the check fails rather than passing.** A check that cannot find its source has verified nothing, and exiting clean would read as protection while checking nothing. On a machine that genuinely has no Trellis task directory, opt out explicitly:
+
+```
+MNEMON_TASK_DIR_OPTIONAL=1 npm test
+```
 
 Not covered by the sync: `tests/`. `build-mnemon-test.sh` has legitimately diverged (the repo copy is newer — it accepts `MNEMON_PLUGIN_PATH` and a path argument, while the task directory copy still hardcodes the live deployment path), so it is reconciled by hand.
