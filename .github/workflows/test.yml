@@ -1,0 +1,51 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # @mnemon-dev/mnemon is published on npm with per-platform binaries as
+      # optionalDependencies and needs no license or credentials, so the e2e
+      # suite can drive a real CLI. Pin the range rather than latest so a new
+      # release cannot turn a green build red without a commit.
+      - name: Install the mnemon CLI
+        run: npm install --global "@mnemon-dev/mnemon@^0.2.10"
+
+      # The plugin falls back to ~/.mnemon for any cwd without a .mnemon, and the
+      # e2e suite asserts it does not touch that root. Redirect HOME to a scratch
+      # dir so the runner's real home is never in scope, and point the suite at
+      # the freshly installed CLI instead of relying on PATH resolution.
+      - name: Run the suite in an isolated home
+        run: |
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          export MNEMON_BIN="$(npm root -g)/@mnemon-dev/mnemon/bin/mnemon.js"
+          # No Trellis task directory exists on a runner, so the docs drift gate
+          # has nothing to compare against. Opt out explicitly rather than
+          # weakening the check for everyone who has the directory.
+          export MNEMON_TASK_DIR_OPTIONAL=1
+          npm test
+
+      - name: Verify the plugin still loads with its clean export shape
+        run: |
+          node --input-type=module -e "
+            const m = await import('./mnemon.js')
+            const named = Object.keys(m).filter((k) => k !== 'default')
+            if (named.length) throw new Error('unexpected named exports: ' + named.join(','))
+            if (m.default?.id !== 'mnemon') throw new Error('unexpected id: ' + m.default?.id)
+            console.log('export shape OK: id=' + m.default.id)
+          "

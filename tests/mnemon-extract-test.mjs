@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { basename, dirname } from "node:path"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { basename, dirname, join } from "node:path"
 import {
   claimRememberable,
   classifyMemory,
@@ -21,7 +22,12 @@ const check = (name, cond, extra = "") => {
 const now = Date.now()
 const tsOld = new Date(now - 5 * 60_000).toISOString()
 const base = { ts: tsOld, sessionID: "ses_t", user: "帮我看看这个接口的返回结构", assistant: "" }
-const root = "/Users/zhouri/project/others/.mnemon"
+// A throwaway project root: extractMemory derives the project name for tags from
+// the grandparent of this path, so it must be a real <something>/<project>/.mnemon
+// shape. Hardcoding a developer's home made this suite unrunnable anywhere else.
+const projectRoot = join(mkdtempSync(join(tmpdir(), "mnemon-extract-")), "sample-project")
+const root = join(projectRoot, ".mnemon")
+mkdirSync(root, { recursive: true })
 const pad = "（这里补充一段说明性的正文，用来把篇幅拉长到实质内容的下限之上，同时不引入任何额外的信号词。）"
 
 check("太短 → 丢弃", extractMemory({ ...base, assistant: "决定用缓存" }, root) === null)
@@ -94,7 +100,7 @@ check("fenceRatio 正常段接近 0", fenceRatio("这是一段正常的中文说
 check("fenceRatio 代码段接近 1", fenceRatio("```bash\n" + "echo x\n".repeat(60) + "```") > 0.9)
 check("正文结构完整", fac?.content.split("\n").length === 3 && fac?.content.startsWith("[fact] "), fac?.content.split("\n").join(" | "))
 check("用户为空时不输出空的用户行", !extractMemory({ ...base, user: "", assistant: "实测这个端点返回 HTTP 200，版本是 0.2.10。" }, root)?.content.includes("用户："))
-check("tags 含项目名", fac?.tags.length === 2 && fac?.tags[1] === basename("/Users/zhouri/project/others"), JSON.stringify(fac?.tags))
+check("tags 含项目名", fac?.tags.length === 2 && fac?.tags[1] === basename(projectRoot), JSON.stringify(fac?.tags))
 check("key 为 12 位 hex", /^[0-9a-f]{12}$/.test(fac?.key ?? ""), fac?.key)
 
 // --- 认领与标记（跨进程语义） ---------------------------------------------

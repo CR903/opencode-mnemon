@@ -9,9 +9,28 @@
 #
 # The test suites import /tmp/mnemon-test-plugin.mjs, so rebuild after every edit
 # to whichever file you intend to verify.
+#
+# Precedence: MNEMON_PLUGIN_PATH, then $1, then the live deployment slot. With no
+# deployment present (fresh clone, CI) fall back to the repo copy rather than
+# failing -- "nothing to test" should not be a hard error when there is a file
+# right here. Set MNEMON_REQUIRE_DEPLOYMENT=1 to opt out of the fallback.
 set -e
 
-SRC="${MNEMON_PLUGIN_PATH:-${1:-$HOME/.config/opencode/plugins/mnemon.js}}"
+DEPLOY="${HOME}/.config/opencode/plugins/mnemon.js"
+REPO="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/mnemon.js"
+
+SRC="${MNEMON_PLUGIN_PATH:-${1:-}}"
+if [ -z "$SRC" ]; then
+	if [ -f "$DEPLOY" ]; then
+		SRC="$DEPLOY"
+	elif [ "${MNEMON_REQUIRE_DEPLOYMENT:-0}" = "1" ]; then
+		echo "no deployment at $DEPLOY and MNEMON_REQUIRE_DEPLOYMENT=1" >&2
+		exit 1
+	else
+		SRC="$REPO"
+	fi
+fi
+
 DST="${MNEMON_TEST_DST:-/tmp/mnemon-test-plugin.mjs}"
 
 if [ ! -f "$SRC" ]; then

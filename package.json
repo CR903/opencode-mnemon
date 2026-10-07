@@ -34,7 +34,7 @@
 		"sync:docs:check": "node scripts/sync-docs.mjs --check",
 		"test:build": "sh tests/build-mnemon-test.sh",
 		"test": "sh tests/build-mnemon-test.sh && node scripts/sync-docs.mjs --check && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
-		"test:deploy": "sh tests/build-mnemon-test.sh \"$PWD/mnemon.js\" && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
+		"test:deploy": "sh tests/build-mnemon-test.sh \"$PWD/mnemon.js\" && node scripts/sync-docs.mjs --check && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
 		"deploy": "node scripts/deploy.mjs",
 		"version:patch": "npm version patch",
 		"version:minor": "npm version minor",

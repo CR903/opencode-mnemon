@@ -60,7 +60,17 @@ Suites (132 checks total):
 
 Tests import `/tmp/mnemon-test-plugin.mjs`, a copy of the plugin with internals appended as exports. **Always run `tests/build-mnemon-test.sh` after editing** — otherwise you are testing a stale copy. The production file stays in its clean `{ id, setup, server }` shape.
 
-`build-mnemon-test.sh` accepts the source path as `$1` or `$MNEMON_PLUGIN_PATH`; default is the live deployment.
+`build-mnemon-test.sh` accepts the source path as `$1` or `$MNEMON_PLUGIN_PATH`; with neither, it uses the live deployment and falls back to the repo copy when no deployment exists (fresh clone, CI). Set `MNEMON_REQUIRE_DEPLOYMENT=1` to disable that fallback.
+
+### Environment overrides
+
+| Variable | Effect |
+|----------|--------|
+| `MNEMON_BIN` | Path to the `mnemon` CLI the e2e suite drives. Defaults to bare `mnemon` on `PATH`. |
+| `MNEMON_TASK_DIR_OPTIONAL=1` | Allow `sync:docs:check` to skip when no Trellis task directory exists. Without it the check fails, since a comparison against nothing is not a pass. |
+| `MNEMON_TEST_DST` | Where the exported test copy is written. Defaults to `/tmp/mnemon-test-plugin.mjs`. |
+
+CI (`.github/workflows/test.yml`) installs `@mnemon-dev/mnemon` from npm — it is publicly published with per-platform binaries and needs no credentials — then runs the suite under a scratch `HOME` so the fallback assertions cannot touch a real memory root.
 
 ## Switches
 
