@@ -37,10 +37,33 @@ import { createRequire } from "node:module"
 import { basename, dirname, join } from "node:path"
 
 const AUTOMEM_DEBUG_LOG = "/tmp/trellis-plugin-debug.log"
+// Append-only with no bound reached 63 MB, and every debugging session greps
+// this file. Rotate on size, keeping the previous generations for post-mortem
+// context -- a rotation often lands mid-investigation. Generations past
+// DEBUG_LOG_KEEP_GENERATIONS are not pruned: the names are never created, so a
+// higher-numbered file can only predate a smaller KEEP value.
+const DEBUG_LOG_MAX_BYTES = 8 * 1024 * 1024
+const DEBUG_LOG_KEEP_GENERATIONS = 2
+
+function rotateDebugLog() {
+  try {
+    const stats = statSync(AUTOMEM_DEBUG_LOG, { throwIfNoEntry: false })
+    if (!stats || stats.size < DEBUG_LOG_MAX_BYTES) return
+    for (let generation = DEBUG_LOG_KEEP_GENERATIONS - 1; generation >= 1; generation--) {
+      const from = `${AUTOMEM_DEBUG_LOG}.${generation}`
+      const to = `${AUTOMEM_DEBUG_LOG}.${generation + 1}`
+      if (existsSync(from)) renameSync(from, to)
+    }
+    renameSync(AUTOMEM_DEBUG_LOG, `${AUTOMEM_DEBUG_LOG}.1`)
+  } catch {
+    // Rotation is best-effort: never let housekeeping break the caller.
+  }
+}
 
 function debugLog(prefix, ...args) {
   const line = `[${new Date().toISOString()}] [${prefix}] ${args.map((a) => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ")}\n`
   try {
+    rotateDebugLog()
     appendFileSync(AUTOMEM_DEBUG_LOG, line)
   } catch {
     // ignore

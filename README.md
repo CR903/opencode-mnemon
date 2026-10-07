@@ -114,7 +114,7 @@ All of the above was found by probing, not reading docs.
 
 ## Debugging
 
-- Plugin log: `/tmp/trellis-plugin-debug.log`, grep `mnemon-auto` (append / remember / `llm extract ok|drop|skipped` / sweep / lease)
+- Plugin log: `/tmp/trellis-plugin-debug.log`, grep `mnemon-auto` (append / remember / `llm extract ok|drop|skipped` / sweep / lease). Rotates at 8 MB to `.log.1` / `.log.2`, so an investigation can still read the previous generation after a rotation lands mid-diagnosis.
 - Load log: `~/.local/share/opencode/log/opencode.log`, `loading plugin` / `failed to load plugin` — the raw counts are inflated; filter with `grep -av "spawning process"`
 
 ## Project conventions
