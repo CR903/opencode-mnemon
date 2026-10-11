@@ -1,37 +1,127 @@
-# Design: OpenCode mnemon自动记忆
+# 技术设计：recall 质量闸门 + token 预算
 
-## Boundaries
+改动边界：`~/project/opencode-mnemon-plugin/mnemon.js` 的**读侧**（`buildRecallContext` 及其调用），写侧（sweep / remember / LLM extract）、hook 注册面、`documents/` 与 `runtime/` 的所有权一律不动。
 
-- 改动面：`~/.config/opencode/plugins/mnemon.js`（主）+ `BalanceDeck/.opencode/plugins/mnemon.js`（同步补丁，保持既有分叉逻辑不动）。SqlDiff / smarterlab / others 无项目级副本，走全局。
-- 不碰：mnemon CLI 本体、dsh 侧、`documents/` 写路径、其它 13 个插件。
-- 与已归档子任务的关系：`--data-dir` 解析是本任务的前置（已落地），本任务只加“写侧”与“文件层”。
+## 1. 分层数据流（重构后）
 
-## Contracts & Data Flow
+```
+ctx.session.hook("prompt")            mnemon.js:466
+  └─ buildRecallContext(query, cwd)   mnemon.js:337   ← 唯一入口，签名不变
+       ├─ gateQuery(query)            纯函数 · 短查询直接跳过 recall 段
+       ├─ getStatusSection(root)      spawn + 60s 进程级缓存 → 单行 ≤200c
+       ├─ runRecall(query)            spawn `recall --limit 12 --verbose`，空/坏输出重试 1 次
+       │    └─ gateRecallResults(payload)   纯函数 · 分数带 + 信号过滤 → {kept, dropped}
+       │         └─ renderRecallSection()   纯函数 · 紧凑行 ≤900c，kept=0 → 返回 null
+       ├─ buildDocsSection()          不动（已有 MIN_DOC_SCORE=3 阈值）
+       ├─ buildRuntimeSection()       不动（≤2048c，按剩余预算裁剪）
+       └─ USAGE_HINT                  扩写：深度检索改为按需自取
+```
 
-- 读侧（prompt hook，`ctx.session.hook("prompt")`，沿用现有）：
-  1. `mnemon --data-dir <root> status/recall`（记忆空间，现有逻辑不动）；
-  2. 读 `<root>/runtime/memories.json` 尾部 N 条（运行时记忆，有界，如最近 5 轮、总 ≤2KB，超裁旧）；
-  3. 读 `<root>/documents/index.json` 做关键词检索，命中标题/摘要才在正文后附“按需阅读清单”（只给相对路径，不贴全文）。
-- 写侧（新增，`ctx.event.subscribe` 后台消费，不阻塞 setup，卸载时 abort——沿用 `feishu-notify.ts:115` 模式）：
-  - 事件源：`session.idle`（主）或 `session.text.ended` 累积（备选，取先验证通的那个）。
-  - reminisce：把本轮（user prompt + assistant 全量文本）发给一个有界摘要器，输出 `remember` 候选（content / cat / imp / entities）或空。
-  - 摘要器选型：A) `ctx.generate.text({ prompt, model: { id } })` 一次性调用（V2 `ctx` 上无 `ctx.session.prompt`，已探测确认）；B) 本地规则（长度/关键词门槛，零成本，召回弱）。B 保底常开，A 只在 B 判空时补抽一次，文件标记或 env 开启。
-  - 写入：`mnemon --data-dir <root> remember ...`（串行，BUSY 退避一次）；同时 append `runtime/opencode-memories.json`（总是成功，不依赖 sqlite）。
+纯函数（`gateQuery` / `gateRecallResults` / `renderRecallSection` / `compressStatus`）是本任务的单测面，经 `tests/build-mnemon-test.sh` 导出；生产文件仍保持纯 `{ id, setup, server }` 形状。
 
-## Tradeoffs
+## 2. 检索调用形式：为什么用 `--verbose` 全量而不是 `--brief`
 
-- LLM 抽取（准、贵、有循环风险）vs 规则抽取（便宜、弱、无风险）：先 B 后 A，开关控制。
-- `session.idle` 可能晚到/不触发：以 `compaction` 钩子兜底（已有提示词），保证压缩前必有一次模型驱动的 remember 机会。
+| 选项 | 结果 | 结论 |
+|---|---|---|
+| `--brief` | 1397c（vs 全量 4616c），**但无 `signals`** | 拿不到判据 |
+| `--brief --verbose` | 实测输出**为空**（不可用组合） | 排除 |
+| `--basic` | 中文整句 **0 命中**（整句当一个 LIKE 模式） | 排除 |
+| `--verbose`（全量） | 有 `score` + `signals.keyword/entity/similarity/graph` | **采用** |
 
-## Compatibility & Rollout
+**token 成本为 0**：全量 stdout（实测 **30 038 字符**，limit 12 + verbose，含 entities 与完整 content；延迟实测 0.22–0.29s，status 0.16s）只进 `spawnSync → JSON.parse`，**永远不进模型上下文**；付的是 CPU。这正是"降 token"的关键一手：把贵的东西留在解析层，只把便宜的结论交给模型。
 
-- 全功能默认关闭？否：读侧保持现状；写侧默认开但保守阈值。三道闸：`TRELLIS_HOOKS=0` / `TRELLIS_DISABLE_HOOKS=1` 总关（读写两侧全停，与 BalanceDeck 三个本地插件同款 `hooksDisabled()`）；`MNEMON_AUTOMEM=0` 只关写侧、保留读侧 recall 注入；`MNEMON_LLM_EXTRACT` 与 `<root>/opencode-llm-extract` 标记文件控 A 方案。
-- **env 开关是进程级的，插件实例全在常驻 server 进程里**：`opencode run` 只是连到该 server 的客户端，所以 `TRELLIS_HOOKS=0 opencode run ...` 无法生效（A/B 探针实测：headless 端无 `skipped` 日志，append 仍由 server 端完成）。env 开关必须在**启动 OpenCode server 的环境**里 export 才生效，且不能按项目区分。这正是 A 方案开关选择"文件标记优先、env 兜底"的原因。
-- 回滚：删新增代码块即回退到已归档状态（纯加法改动，无 schema 变更）。
+风险控制：`spawnSync` 默认 `maxBuffer` 1MB，实测 30KB 远在安全区；单测断言输出 <200KB，超限即视为该路径不可用 → 降级为 `--brief` + 仅分数过滤（无信号闸门），日志记 `fallback=brief`。
 
-## Open Questions
+## 3. 闸门规则（对标 dsh `strict-v1`，按本库分数分布调参）
 
-- ~~`session.idle` / `session.text.ended` 在当前 OpenCode 版本事件流中的实际 payload~~ **已关闭**：`session.text.ended` 带 `sessionID` + 当轮 assistant 全文；`session.idle` 在本版本从不触发，写侧改用 `text.ended` + 定稿窗口 + 尾部重扫。
-- ~~`ctx.session.prompt` 临时会话是否触发本插件 prompt hook~~ **已关闭（前提不成立）**：V2 `ctx` 上没有 `ctx.session.prompt`。改用 `ctx.generate.text`，它不经过 session prompt hook，故无递归风险；`[mnemon-extract]` marker 仍保留作为兜底（防未来版本行为变化）。
-- A 方案开关的生效范围。**已定为文件标记优先**：`<root>/opencode-llm-extract` 按项目生效、`touch`/`rm` 即时生效、无需重启进程；env 保留作进程级开关与 `=0` 总闸。理由：env 依赖启动 OpenCode 时的进程环境，且无法区分 BalanceDeck 与 others 两个项目。
-- ~~`ctx.generate.text` 的 `model` 参数形状~~ **已关闭（探针实测，非文档可得）**：`ctx.model` / `ctx.provider` 不在公开的 `PluginContext` 类型里，签名只能靠运行时探测。结论：`model` 必须是 `{ id, modelID, providerID }`，`id` 只能是裸 modelID（传 `provider/model` 会被拼成 `provider/provider/model`）；且该模型必须在 `ctx.model.list().data` 中（返回体是 `{location, data}`，需取 `.data`）——当前 73 个模型不含 `sensenova`，故 `sensenova/*` 硬编码必然失败。不传 `model` 走免费档报 `OpenCode's free tier can only be used from within OpenCode`。因此模型必须**按目录解析**（`pickModelRef`），不能硬编码名字；这对 BalanceDeck 同步（步骤 7）是硬约束。
+dsh 的 `STRICT_RECALL_QUALITY_POLICY`（`dsh-mnemon-source-memory-spaces/lib/index.js:1084-1150`）：候选扩 3 倍 → `<lowScoreThreshold` 丢 → medium ≤4 → unknown ≤2。直接照抄**无效**，因为本库分数全部挤在 0.25–0.38（实测），绝对阈值 0.25 几乎不筛任何东西。所以做成三层组合：
+
+```
+RECALL_LIMIT        = 12     // 过采样，对标 candidateMultiplier=3
+RECALL_MIN_SCORE    = 0.25   // 对标 dsh lowScoreThreshold
+RECALL_BAND         = 0.15   // 相对带：score < topScore - 0.15 → drop（挡尾巴）
+RECALL_MAX          = 4      // 对标 dsh maxMediumResults=4
+RECALL_MIN_QCHARS   = 6      // 非空字符数门槛
+STATUS_TTL_MS       = 60_000
+```
+
+过滤顺序（`gateRecallResults`）：
+
+1. `score` 缺失 / 非有限数 / >1 → drop
+2. `score < RECALL_MIN_SCORE` → drop
+3. `score < topScore - RECALL_BAND` → drop（相对带，处理分数天花板只有 0.38 的现实）
+4. **信号判定**：`keyword + entity + similarity === 0` 的条目记为 *padding*（本库实测的"图邻居/最近凑数"，`删` 这类查询 5 条全是 padding）
+   - 存在至少 1 条带 lexical 信号的候选 → padding 全 drop，剩下的按分排序取前 `RECALL_MAX`
+   - **全部是 padding**（0 条带信号）→ 返回空，整段不注入，改注入一行按需提示（见 §5）
+
+这一步是本库唯一能区分"命中"与"凑数"的判据：分数区分不了（0.30 的凑数项和 0.31 的命中项同分），信号能。
+
+## 4. 渲染与预算
+
+段头显式告知被过滤，模型据此可以不信任：
+
+```
+Relevant recall (2/12 kept, scores are weak evidence):
+— [0.38·preference] 本仓库写配置文件一律用 tabs，不用空格。以后碰到配置文件…
+— [0.31·insight] Trellis SessionStart 上下文已加载 ✓ …
+```
+
+每行 = `— [score·category] 摘录≤120c`（`insight.content` 压掉换行），约 150–180 字符 → 4 条 ≈ 700c，段头 60c，**≤900c**。
+
+| 段 | 现状 | 目标 | 手段 |
+|---|---|---|---|
+| Status | 1476c | **≤200c** | 解析 JSON 压成单行 + 60s 缓存 |
+| Relevant recall | 4616c | **≤900c** | 过采样→闸门→紧凑行；空则整段消失 |
+| documents | ≤700c | 不变 | 已有阈值 |
+| runtime | ≤2048c | 不变 | 已有界，按剩余预算裁剪 |
+| hint | ≈200c | ≈300c | 扩写一句按需检索指引 |
+| **合计** | **≈9000c** | **≤3000c** | 降幅 ≥66% |
+
+`compressStatus`：`mnemon status` 输出 JSON（已验证），压成
+`17 insights · 19 facts · 9 decisions · 8 preferences · 299 edges · 344KB · default/mnemon.db`；
+JSON 解析失败 → 退回原样截断到 200c（兜底，不丢段）。缓存键 = memory root（不同项目不同库），值 = `{ts, text}`。
+
+## 5. 失败与降级路径
+
+| 情况 | 行为 |
+|---|---|
+| 查询非空字符 < 6 | 不 spawn recall，注入 runtime+docs+hint；段位置留一行 `(short message — recall skipped)` |
+| recall 空输出 / JSON 解析失败（观测到过 `SQLITE_BUSY: database is locked`） | 等 150ms 重试 1 次 → 仍失败：**跳过该段**，日志 `recall gate: skipped reason=empty\|parse` |
+| 闸门后 0 条 | 整段不注入，替换一行 `(no confident match — run mnemon recall "<query>" --intent WHY\|WHEN\|ENTITY yourself)` |
+| `MNEMON_RECALL=0` | 跳过 recall 段（进程级，A/B 对照用；per-project 才需要 flag file，见 spec 决策） |
+| `TRELLIS_HOOKS=0` / `MNEMON_AUTOMEM=0` | 语义不变（前者全关、后者只关写侧） |
+
+**注入本身永不失败**：`buildRecallContext` 内任何一步抛错都被 `runMnemon` 的 try/catch 与新函数的守卫吸收，最坏退化为"只有 runtime + docs + hint"。
+
+## 6. 可观测性（R7）
+
+`debugLog("mnemon-auto", ...)` 追加一行，验证靠日志而非"上下文里没看到"反推：
+
+```
+recall gate: kept=2 dropped=10 padding=9 reason=band|score|signal ms=214 chars=640 status=cached|spawn
+```
+
+## 7. USAGE_HINT 扩写（R4：深度检索改按需）
+
+```
+Use mnemon when it materially improves continuity. After responding, decide whether durable
+preferences, decisions, insights, facts, or context should be stored with mnemon remember/link.
+The recall above is a shallow pre-filter, not the whole store. For deeper retrieval run
+mnemon recall "<focused query>" --intent WHY|WHEN|ENTITY --limit 10 --verbose
+```
+
+这是对齐 dsh `recallMode: guided`（"only when relevant evidence is missing"）和官方 skill（on-demand + `--intent`）的做法：**常驻的只留便宜且确定的内容，贵的检索交给模型按需发起**。
+
+## 8. 权衡记录
+
+1. **组合闸门 vs 照抄 dsh 阈值** → 组合。绝对阈值在本库不筛东西，相对带 + 信号判定才有效；代码里注释写明这个实测依据，避免后人"优化"回纯阈值。
+2. **`--verbose` 全量 vs `--brief` 省 CPU** → verbose。token 是稀缺资源，CPU 不是；且 brief 没有 signals 就没有闸门。
+3. **每条消息召回 vs 只在 SessionStart 召回** → 保持每条消息。召回质量依赖当前消息内容，SessionStart 拿不到它；用短查询门槛 + status 缓存 + 闸门压成本，"想要更多"由 §5 按需提示承接。
+4. **短查询跳过会不会漏记忆** → 不会。短查询（`删`/`继续`）实测召回 0 证据项，而 runtime 段（最近对话）仍然注入，上下文连续性不受影响。
+
+## 9. 兼容与回滚
+
+- 改动集中在 `buildRecallContext` + 4 个新纯函数，**hook 注册面一行不动**，写侧路径零改动。
+- 代码回滚 = 删除新增块，恢复 `runMnemon(["recall", query, "--limit", "5"], { cwd })` 一行。
+- 运行时降级 = `MNEMON_RECALL=0`（不回滚代码即可 A/B 对照旧路径）。
+- `docs/` 快照由 `npm run sync:docs` 从任务目录派生，README 属实时源文件，直接改。

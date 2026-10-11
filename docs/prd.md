@@ -1,34 +1,63 @@
-# OpenCode mnemon自动记忆
+# mnemon recall 质量闸门与 token 优化
 
 ## Goal
 
-参考 dsh-mnemon（v0.5.24，三层：运行时记忆 / 项目档案 / 记忆空间，存储范围=工作区），在 OpenCode 实现对等的自动记忆。底层同为 mnemon CLI（dsh 侧 Mnemon Native 0.2.10），目录同构（`<workspace>/.mnemon/{runtime,data,documents}`），故读写可互通。
+让 opencode-mnemon 插件的读侧注入"更少、更快、更准"：无关记忆不再进上下文，注入体积降到现状 1/3 以内，同时给模型留一条按需深度检索的路。对标标准为 dsh-mnemon 的 `recallQuality: strict-v1`。
+
+## Background（2026-10-11 实测，仓库 `/Users/zhouri/project/others`）
+
+现状读侧链路（`mnemon.js:466` → `buildRecallContext` `mnemon.js:337`）每条用户消息注入四段：
+
+| 段 | 来源 | 实测体积 |
+|---|---|---|
+| `Status:` | `mnemon status`（spawn #1，129ms） | 1476 字符 |
+| `Relevant recall:` | `mnemon recall <q> --limit 5`（spawn #2，186ms） | 4616 字符 |
+| Workspace documents | `documents/index.json`，token 打分（**已有阈值** `MIN_DOC_SCORE=3`） | ≤700 字符 |
+| Recent runtime turns | `runtime/opencode-memories.json` | ≤2048 字符 |
+| USAGE_HINT | 常量 | ≈200 字符 |
+| **合计** | | **≈9000 字符 / 条消息** |
+
+召回质量实测（`--verbose` 看信号）：
+
+| 查询 | 结果 | 信号 |
+|---|---|---|
+| `删` | 5 条，score 全 = 0.30 | keyword=0 entity=0 similarity=0，仅 graph/temporal |
+| `为什么每次给opencode发消息调取mnemon` | 5 条，0.23–0.30 | 同上，全 0 |
+| `dsh-mnemon 的召回质量闸门标准是什么`（limit 12） | 12 条，0.24–0.31 | 分数全挤在 0.25–0.38 区间 |
+
+根因：`mnemon recall` **没有 min-score 参数**，`--limit N` 是硬凑满；intent 自动识别（WHY/WHEN/ENTITY）会切到图遍历，返回的是"图邻居 + 最近条目"而非匹配项。CLI 无 `--min-score`，闸门只能在插件层做。
+
+已排除的方案：`--basic`（SQL LIKE）对中文整句 **0 命中**（把整句当一个 LIKE 模式），只有单字查询 `删`/`提交` 才有结果；`--brief --verbose` 组合输出为空（不可用，拿不到 signals）。
 
 ## Requirements
 
-- 存储范围=工作区：读写根为 `<cwd>/.mnemon`（无则回退全局），与 dsh 同址，`data/`（记忆空间）、`runtime/`（运行时记忆）、`documents/`（项目档案）三层共用。
-- 自动记录：`session.idle` 后台 reminisce，LLM 判断本轮值得长期保留的事实并 `remember`（对标 dsh「主动记录」）， Pickup率可配（环境变量开关 + 重要性阈值）。
-- 运行时记忆：每轮确定性落盘（user prompt + assistant 全量文本摘要）到 `runtime/`，prompt 时注入最近 N 轮（对标 dsh「运行时记忆常驻」）。
-- 项目档案：prompt 时先检索 `documents/index.json`，命中再按需读全文（对标「先检索再按需阅读全文」）；只读，不自动写。
-- 防循环：写入动作不得再次触发 prompt/tool 钩子；单轮写入有上限；失败静默。
-
-## Constraints
-
-- OpenCode 插件无 UI 插槽：dsh 的「回合记忆栏 / 存入记忆按钮」不做，用 compaction 提示 + 手动 `remember` 命令覆盖。
-- 不与 dsh 并发写同一 sqlite 无锁：写操作串行化，`SQLITE_BUSY` 时退避重试一次，仍失败则降级只写文件层。
-- token 成本： reminisce 调用有上限（每 idle 最多 1 次，只在有实质对话轮次时触发）。
+- **R1 质量闸门（A）**：recall 结果经分数 + 信号过滤后才渲染；过滤后为空 → **整段不注入**（宁可沉默也不上噪声）。
+- **R2 短查询门槛（B）**：非空字符数低于阈值的查询不跑 recall，只注入 runtime + docs + hint（`删`、`继续`、`提交` 这类消息本来也召不回东西）。
+- **R3 缓存与降级（C）**：`status` 进程级 TTL 缓存（60s），每条消息最多 1 次 spawn；CLI 空输出 / 非 0 退出 / `SQLITE_BUSY` → 重试一次，仍失败则**静默跳过该段**，注入本身永不失败。
+- **R4 深度检索改按需（D）**：注入只保留浅层 top 摘要；USAGE_HINT 明确告知模型"要更多就自己跑 `mnemon recall "<聚焦查询>" --intent WHY|WHEN|ENTITY --limit 10`"。召回段为空时也给出这句提示，而不是留白。
+- **R5 文档同步（E）**：`README.md` 第 5 行写的"inject on the next SessionStart / idle turn"与实际"每条 prompt"不符，改为与实现一致，并补读侧闸门说明。
+- **R6 Token 预算（核心新需求）**：
+  - 注入总字符 ≤ **3000**（现状 ≈9000，降幅 ≥66%）
+  - `Relevant recall` 段 ≤ **900**
+  - `Status` 段 ≤ **200**（压缩成单行）
+  - 召回结果以**紧凑行**渲染（`— [0.38·preference] 摘录≤120c`），不再注入 CLI 原始 JSON
+- **R7 可观测**：debug log（`/tmp/trellis-plugin-debug.log`）记录本次 recall 的 `kept/dropped/reason/chars/ms`，验证时能用日志证明闸门生效，而不是靠"上下文里没看到"反推。
 
 ## Acceptance Criteria
 
-- [x] 工作区会话的 recall/status 命中 `<cwd>/.mnemon`（回归通过：`status` 的 `db_path` 落在 `<workspace>/.mnemon/data/default/mnemon.db`）
-- [x] 一轮有实质内容的对话结束后 `data/` 库新增 insight（生产实测 5 条：fact 2 / insight 1 / preference 2，`log` 含 remember）。触发器为 `session.text.ended` + 60s 定稿窗口 + 下一事件或 75s 尾部重扫（非 `session.idle`，见 implement.md 步骤 1）。dsh 侧可见：读写同一 `<workspace>/.mnemon/data` 库，`mnemon --data-dir <workspace>/.mnemon recall/status` 即 dsh 的同一地址；dsh 自己的 `runtime/memories.json` 字节与 mtime 均未变。
-- [x] `runtime/` 每轮追加记录（`opencode-memories.json`，50 条封顶、每段 ≤2000 字），prompt 注入最近 5 条且预算有界（实测注入块 523–2455 字）
-- [x] `documents/` 只读：仅读 `documents/index.json` 做关键词命中，实测 mtime 未变、无写入
-- [x] 连续多轮无重复注入、无钩子递归：约 2 小时内 prompt hook 仅 10 次调用（≈每轮 1 次），跨进程/同批重复写入均被 `rememberKey` 去重拦下
-- [x] A 方案（LLM 补抽）默认关闭、可配开启，开启不影响规则路径：`<root>/opencode-llm-extract` 文件标记按项目生效（`touch` 即开、`rm` 即关，无需重启进程，文件内容可写模型 ID），`MNEMON_LLM_EXTRACT=1` 进程级开启、`=0` 为总闸且压过标记文件；模型异常/超时静默回退到规则结果，`[mnemon-extract]` marker 防递归。验证：`tests/mnemon-llm-extract-test.mjs` 69 项全 PASS（含开关矩阵、模型目录解析降级、模型引用形态单测、npm-shim 解析、总闸行为矩阵与 setup 接线，以及「规则命中的轮次不消耗 LLM」）。**已生产验证**：headless 探针一轮无信号词的对话经规则丢弃后由真实模型抽出（`cat: preference imp: 5 chars: 251`）并 `remember ok`，`recall` 以 0.725 取回。
-- [x] 无 `.mnemon` 项目行为不变（回退全局）：`resolveMemoryRoot` 回退到 `~/.mnemon`，全局根 `~/.mnemon/runtime/opencode-memories.json` 在 `/tmp` 下无 `.mnemon` 的 headless 探针中被首次创建且条目落盘。dsh 的全局 `runtime/memories.json` 全程 11 条、sha256 `4ea85af594ac` 未动；探针污染（2 条 db 记忆 + 2 条 runtime 条目）已清。
-- [x] `failed to load plugin` 为零，其余插件不受影响：最后一次加载失败停在步骤 5 的编辑中间态（03:29:58），此后热重载数十次无一失败；8 个插件（全局 5 + BalanceDeck 3）全部加载成功。
+- [ ] 新增单测覆盖闸门：padding-only 查询（全 0 信号）→ 0 条；带 lexical 命中 → ≤4 条；分数带过滤生效；短查询不触发 recall；status 缓存命中不再 spawn
+- [ ] `npm test` 全绿（现基线 132 项 + 新增项）
+- [ ] headless 探针实测：真实 `<mnemon_context>` 总字符 ≤3000，recall 段 ≤900，status 段 ≤200
+- [ ] 探针日志出现 `recall gate: kept=N dropped=M ...` 字样，且 dropped>0（对 padding 查询）
+- [ ] 对 `删` / `继续` 这类短查询，注入体中**不含** `Relevant recall` 段
+- [ ] status 在 60s 内只 spawn 一次（日志可证）
+- [ ] CLI 返回空 / 报错时注入仍成功，且不含空段
+- [ ] `npm run sync:docs:check` 通过（docs/ 快照与任务目录零漂移），README 描述与实现一致
 
-## Notes
+## Constraints
 
-- 复杂任务：另见 `design.md`（技术设计）与 `implement.md`（执行计划），三者齐后方可 `task.py start`。
+- 不改 mnemon CLI 本体、不写 `documents/`、不碰 dsh 的 `runtime/memories.json`（硬不变式）
+- 不新增 npm 依赖，只用 node 内置模块
+- 配置文件一律 tabs
+- 保留既有 kill switch 语义：`TRELLIS_HOOKS=0` 关全部；`MNEMON_AUTOMEM=0` 只关写侧；**新增** `MNEMON_RECALL=0` 只关 recall 段（进程级，A/B 对照用）
+- 召回过滤是"降噪"不是"提精度"：本库分数天花板只有 0.38，闸门不承诺语义准确率，只承诺不把 0 信号的凑数项送进上下文

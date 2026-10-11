@@ -33,7 +33,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const docsDir = resolve(join(here, "..", "docs"))
 
 const FILES = ["prd.md", "design.md", "implement.md"]
-const TASK_SLUG = "10-04-opencode-mnemon-auto-memory"
+const TASK_SLUG = "10-11-mnemon-recall-gate"
 const TASKS_ROOT = join(homedir(), "project", "others", ".trellis", "tasks")
 
 const args = process.argv.slice(2)

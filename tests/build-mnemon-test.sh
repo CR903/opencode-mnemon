@@ -40,6 +40,6 @@ fi
 
 cp "$SRC" "$DST"
 cat >> "$DST" <<'EOF'
-export { claimRememberable, classifyMemory, clipText, extractEntities, extractMemory, fenceRatio, headlineOf, LLM_ENABLE_FLAG, LLM_MODEL_CHAIN, llmExtractMemory, llmWorthyEntry, buildLlmPrompt, parseLlmReply, llmExtractConfig, hooksDisabled, mnemonCommand, modelRefFromName, pickModelRef, markRemembered, sweepAndRemember, setLlmGenerate, setLlmCatalog, withTimeoutMs }
+export { claimRememberable, classifyMemory, clipText, extractEntities, extractMemory, fenceRatio, headlineOf, LLM_ENABLE_FLAG, LLM_MODEL_CHAIN, llmExtractMemory, llmWorthyEntry, buildLlmPrompt, parseLlmReply, llmExtractConfig, hooksDisabled, mnemonCommand, modelRefFromName, pickModelRef, markRemembered, sweepAndRemember, setLlmGenerate, setLlmCatalog, withTimeoutMs, gateQuery, gateRecallResults, renderRecallSection, compressStatus, getStatusSection, runRecall, buildRecallContext, recallEnabled, normalizeRecallItem, STATUS_CACHE, STATUS_TTL_MS, RECALL_LIMIT, RECALL_MIN_SCORE, RECALL_BAND, RECALL_MAX, RECALL_MIN_QCHARS, RECALL_SECTION_MAX_CHARS, RECALL_EXCERPT_CHARS, STATUS_SECTION_MAX_CHARS }
 EOF
 echo "test copy rebuilt: $DST <- $SRC ($(wc -l < "$DST") lines)"

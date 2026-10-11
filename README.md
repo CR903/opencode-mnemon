@@ -2,7 +2,7 @@
 
 OpenCode plugin for **project-scoped automatic memory** on top of the [mnemon](https://github.com/dsh) CLI.
 
-Conversation turns are captured at runtime, distilled (rules first, LLM as fallback), written back through `mnemon remember`, and injected again on the next `SessionStart` / idle turn. No per-user setup: memories land in `<cwd>/.mnemon/` when the project has one, and fall back to `~/.mnemon` when it does not.
+Conversation turns are captured at runtime, distilled (rules first, LLM as fallback), written back through `mnemon remember`, and a gated slice of memory is re-injected at the start of every user prompt. No per-user setup: memories land in `<cwd>/.mnemon/` when the project has one, and fall back to `~/.mnemon` when it does not.
 
 ## What it does
 
@@ -11,7 +11,7 @@ Two sides, sharing one mnemon store.
 | Side | Trigger | Effect |
 |---|---|---|
 | **Write** | `session.text.ended` | Append the turn to a per-project runtime file, then after a 60s finalize window claim + extract + `mnemon remember` (async, BUSY backoff) |
-| **Read** | `SessionStart` + tail sweep | Inject the most relevant memories into context |
+| **Read** | `prompt` hook (every user message) | Inject a quality-gated recall section + cached one-line status + workspace-doc hints + recent runtime turns (≤3000 chars total) |
 
 Three layers, mirroring dsh-mnemon:
 
@@ -21,6 +21,18 @@ Three layers, mirroring dsh-mnemon:
   data/         the mnemon store (sqlite graph)
   documents/    read-only: indexed for recall, never auto-written
 ```
+
+## Recall quality gate
+
+`mnemon recall` has no `--min-score`, and `--limit N` pads to N with graph/temporal neighbours when intent auto-detects to WHY/WHEN/ENTITY — so the plugin gates results before injection (task 10-11):
+
+- Messages under 6 non-whitespace characters skip the recall spawn entirely (`删` / `继续` measured zero evidence hits).
+- Results are oversampled (`--limit 12 --verbose`), then filtered in order: invalid or `>1` scores drop, `< 0.25` drops, `< topScore − 0.15` drops, and items with `keyword+entity+similarity === 0` are treated as *padding* — dropped whenever any lexical hit exists. All padding → the whole section is omitted (one on-demand hint line remains).
+- Kept results (≤ 4) render as compact lines (`— [0.38·preference] excerpt…`, section ≤ 900 chars); the ~30 KB verbose JSON only feeds `JSON.parse`, never the model context. The status section is compressed to one line (≤ 200 chars) and cached 60s per memory root.
+- Empty or unparseable CLI output (observed `SQLITE_BUSY`) retries once after 150ms, then drops the section — injection never fails.
+- The hint tells the model deep retrieval is on demand: `mnemon recall "<focused query>" --intent WHY|WHEN|ENTITY --limit 10 --verbose`.
+
+This is noise reduction, not precision engineering: this store's scores cluster in 0.25–0.38, so the gate promises only that zero-signal padding never reaches the context.
 
 ## Hard invariants
 
@@ -46,14 +58,15 @@ The deploy script never leaves the slot momentarily empty: the new link is creat
 ## Testing
 
 ```sh
-npm test                          # rebuild the test copy, then run all three suites
+npm test                          # rebuild the test copy, then run all four suites
 npm run test:deploy               # same, but against $PWD/mnemon.js instead of the live deploy
 ```
 
-Suites (132 checks total):
+Suites (182 checks total):
 
 | File | Coverage |
 |---|---|
+| `tests/mnemon-recall-gate-test.mjs` | Recall gate: query floor, score/band/signal filtering, compact-line budgets, status compression + TTL cache |
 | `tests/mnemon-extract-test.mjs` | Rule extraction: headlines, entities, categories, fence ratio, dedupe |
 | `tests/mnemon-remember-e2e.mjs` | Real `mnemon remember --data-dir` round trip; global-root isolation |
 | `tests/mnemon-llm-extract-test.mjs` | LLM switch matrix, model catalog resolution, prompt/parse, timeout, silent fallback |
@@ -81,6 +94,7 @@ CI (`.github/workflows/test.yml`) installs `@mnemon-dev/mnemon` from npm — it 
 | `MNEMON_LLM_EXTRACT=0` | process | master kill, overrides the flag file |
 | `MNEMON_LLM_MODEL` | process | overrides the flag file's model content |
 | `MNEMON_AUTOMEM=0` | process | write side off; **read side stays on** |
+| `MNEMON_RECALL=0` | process | recall section off; status / docs / runtime / hint stay on |
 | `TRELLIS_HOOKS=0` / `TRELLIS_DISABLE_HOOKS=1` | process | master kill, **both sides stop** |
 
 The flag file's non-empty content is treated as a model ID.
@@ -119,12 +133,17 @@ All of the above was found by probing, not reading docs.
 | `MIN_RUNTIME_TEXT_CHARS` | 20 |
 | `RUNTIME_RECENT_COUNT` | 5 |
 | `LLM_TIMEOUT_MS` / `LLM_MAX_ENTITIES` | 25 000 / 6 |
+| `RECALL_LIMIT` / `RECALL_MAX` | 12 / 4 |
+| `RECALL_MIN_SCORE` / `RECALL_BAND` | 0.25 / 0.15 |
+| `RECALL_MIN_QCHARS` | 6 |
+| `STATUS_TTL_MS` | 60 000 |
+| `RECALL_SECTION_MAX_CHARS` / `STATUS_SECTION_MAX_CHARS` | 900 / 200 |
 
 `MIN_RUNTIME_TEXT_CHARS` drops short turns **silently** — a probe that replies `好` will look like a broken pipeline. It is not.
 
 ## Debugging
 
-- Plugin log: `/tmp/trellis-plugin-debug.log`, grep `mnemon-auto` (append / remember / `llm extract ok|drop|skipped` / sweep / lease). Rotates at 8 MB to `.log.1` / `.log.2`, so an investigation can still read the previous generation after a rotation lands mid-diagnosis.
+- Plugin log: `/tmp/trellis-plugin-debug.log`, grep `mnemon-auto` (append / remember / `llm extract ok|drop|skipped` / sweep / lease / `recall gate: kept= dropped= padding= reason= ms= chars= status=cached|spawn`). Rotates at 8 MB to `.log.1` / `.log.2`, so an investigation can still read the previous generation after a rotation lands mid-diagnosis.
 - Load log: `~/.local/share/opencode/log/opencode.log`, `loading plugin` / `failed to load plugin` — the raw counts are inflated; filter with `grep -av "spawning process"`
 
 ## Project conventions
@@ -134,7 +153,7 @@ All of the above was found by probing, not reading docs.
 
 ## Documentation
 
-`docs/prd.md`, `docs/design.md`, `docs/implement.md` hold the requirements, technical design, and the 8-step execution record with verification evidence. The Trellis task directory at `~/project/others/.trellis/tasks/10-04-opencode-mnemon-auto-memory/` is the working copy; `docs/` is a one-way snapshot of it, kept in git because that task directory is not version controlled anywhere.
+`docs/prd.md`, `docs/design.md`, `docs/implement.md` hold the requirements, technical design, and the execution record with verification evidence. The Trellis task directory at `~/project/others/.trellis/tasks/10-11-mnemon-recall-gate/` is the working copy; `docs/` is a one-way snapshot of it, kept in git because that task directory is not version controlled anywhere.
 
 Edit the task documents, then sync:
 

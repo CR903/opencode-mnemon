@@ -1,0 +1,239 @@
+import { spawnSync } from "node:child_process"
+import {
+  RECALL_BAND,
+  RECALL_EXCERPT_CHARS,
+  RECALL_MAX,
+  RECALL_MIN_QCHARS,
+  RECALL_MIN_SCORE,
+  RECALL_SECTION_MAX_CHARS,
+  STATUS_CACHE,
+  STATUS_SECTION_MAX_CHARS,
+  STATUS_TTL_MS,
+  compressStatus,
+  gateQuery,
+  gateRecallResults,
+  getStatusSection,
+  renderRecallSection,
+} from "/tmp/mnemon-test-plugin.mjs"
+
+let fail = 0
+const check = (name, cond, extra = "") => {
+  console.log(`${cond ? "PASS" : "FAIL"} ${name}${extra ? ` — ${extra}` : ""}`)
+  if (!cond) fail++
+}
+
+// --- 合成 fixture（形状对齐 recall --verbose 的条目；不含任何真实记忆内容）----
+
+const insight = (id, content, category = "fact") => ({
+  id,
+  content,
+  category,
+  importance: 4,
+  tags: ["opencode", "workspace"],
+  entities: [],
+  source: "agent",
+  access_count: 0,
+  created_at: "2026-10-11T00:00:00.000Z",
+  updated_at: "2026-10-11T00:00:00.000Z",
+})
+
+// graph/temporal neighbour with zero lexical signal — the measured padding form.
+const paddingItem = (id, score) => ({
+  insight: insight(id, `图邻居凑数条目 ${id}，与当前查询没有关系。`),
+  score,
+  intent: "WHEN",
+  via: "temporal",
+  signals: { keyword: 0, entity: 0, similarity: 0, graph: 1 },
+})
+
+// A real lexical hit: at least one of keyword/entity/similarity is non-zero.
+const lexicalItem = (id, score, category = "preference", signals = { keyword: 2, entity: 1, similarity: 0.4, graph: 0 }) => ({
+  insight: insight(id, `与查询真实相关的记忆 ${id}：本仓库配置文件一律用 tabs 缩进，不要空格。`, category),
+  score,
+  intent: "WHY",
+  via: "keyword",
+  signals,
+})
+
+// --- 常量与 design.md §3 一致性 --------------------------------------------
+
+check("RECALL_MIN_SCORE=0.25", RECALL_MIN_SCORE === 0.25, String(RECALL_MIN_SCORE))
+check("RECALL_BAND=0.15", RECALL_BAND === 0.15, String(RECALL_BAND))
+check("RECALL_MAX=4", RECALL_MAX === 4, String(RECALL_MAX))
+check("RECALL_MIN_QCHARS=6", RECALL_MIN_QCHARS === 6, String(RECALL_MIN_QCHARS))
+check("STATUS_TTL_MS=60_000", STATUS_TTL_MS === 60_000, String(STATUS_TTL_MS))
+
+// --- gateQuery：短查询门槛 --------------------------------------------------
+
+check('gateQuery("删") === false', gateQuery("删") === false)
+check('gateQuery("继续") === false', gateQuery("继续") === false)
+check('gateQuery("") === false', gateQuery("") === false)
+check('gateQuery("   ") === false', gateQuery("   ") === false)
+check('gateQuery(非字符串) === false', gateQuery(null) === false && gateQuery(undefined) === false)
+check(
+  'gateQuery("dsh-mnemon 的召回质量闸门标准") === true',
+  gateQuery("dsh-mnemon 的召回质量闸门标准") === true,
+)
+check(
+  'gateQuery("为什么每次给opencode发消息调取mnemon") === true',
+  gateQuery("为什么每次给opencode发消息调取mnemon") === true,
+)
+check("空白不计入门槛字符数", gateQuery("a b c") === false && gateQuery("abcdef") === true)
+
+// --- padding-only → 整段不注入 ---------------------------------------------
+
+const paddingPayload = [
+  paddingItem("m1", 0.3),
+  paddingItem("m2", 0.3),
+  paddingItem("m3", 0.3),
+  paddingItem("m4", 0.3),
+  paddingItem("m5", 0.3),
+]
+const gatedPad = gateRecallResults(paddingPayload)
+check("padding-only → kept=0", gatedPad.kept.length === 0, `kept=${gatedPad.kept.length}`)
+check("padding-only → dropped=5", gatedPad.dropped === 5, `dropped=${gatedPad.dropped}`)
+check("padding-only → padding=5", gatedPad.padding === 5, `padding=${gatedPad.padding}`)
+check("padding-only → reason=signal", gatedPad.reason === "signal", gatedPad.reason)
+check("padding-only → total=5", gatedPad.total === 5, String(gatedPad.total))
+check("padding-only → renderRecallSection 返回 null", renderRecallSection(gatedPad) === null)
+
+// --- lexical 命中 → 相对带过滤 + cap=4 --------------------------------------
+
+const mixedPayload = [
+  lexicalItem("l1", 0.38),
+  paddingItem("p1", 0.37),
+  paddingItem("p2", 0.33),
+  lexicalItem("l2", 0.31, "insight"),
+  lexicalItem("l3", 0.29, "fact"),
+  lexicalItem("l4", 0.27),
+  lexicalItem("l5", 0.26), // 第 5 个 lexical 命中：cap 生效被截掉
+  lexicalItem("l6", 0.22), // < RECALL_MIN_SCORE → score drop
+]
+const gatedMixed = gateRecallResults(mixedPayload)
+check("lexical 命中 → kept=4（cap 生效）", gatedMixed.kept.length === 4, `kept=${gatedMixed.kept.length}`)
+check("lexical 命中 → padding 全 drop", gatedMixed.padding === 2, `padding=${gatedMixed.padding}`)
+check("lexical 命中 → dropped=4", gatedMixed.dropped === 4, `dropped=${gatedMixed.dropped}`)
+check("lexical 命中 → topScore=0.38", gatedMixed.topScore === 0.38, String(gatedMixed.topScore))
+check("lexical 命中 → reason=score|signal", gatedMixed.reason === "score|signal", gatedMixed.reason)
+check(
+  "lexical 命中 → kept 按分降序",
+  gatedMixed.kept.map((item) => item.score).join(",") === "0.38,0.31,0.29,0.27",
+  gatedMixed.kept.map((item) => item.score).join(","),
+)
+check(
+  "lexical 命中 → render 段头带 N/M",
+  renderRecallSection(gatedMixed).startsWith("Relevant recall (4/8 kept, scores are weak evidence):"),
+  renderRecallSection(gatedMixed).split("\n")[0],
+)
+
+// --- 相对带（高分场景才咬得到；本库天花板 0.38 时带在阈值之下）----------------
+
+const bandPayload = [lexicalItem("h1", 0.9), lexicalItem("h2", 0.8), lexicalItem("h3", 0.5)]
+const gatedBand = gateRecallResults(bandPayload)
+check("相对带 → 0.5 < 0.9-0.15 被 drop", gatedBand.kept.length === 2 && gatedBand.dropped === 1, `kept=${gatedBand.kept.length} dropped=${gatedBand.dropped}`)
+check("相对带 → reason=band", gatedBand.reason === "band", gatedBand.reason)
+
+// --- score 合法性 -----------------------------------------------------------
+
+const invalidPayload = [
+  { insight: insight("x1", "无 score 的条目"), signals: { keyword: 1 } },
+  { insight: insight("x2", "score 越界"), score: 1.4, signals: { keyword: 1 } },
+  { insight: insight("x3", "score 非数字"), score: "abc", signals: { keyword: 1 } },
+  { insight: insight("x4", "score 为 null"), score: null, signals: { keyword: 1 } },
+  { insight: insight("x5", "score 缺失 signals → 视为 padding"), score: 0.3 },
+]
+const gatedInvalid = gateRecallResults(invalidPayload)
+check("非法 score × 4 → invalid drop", gatedInvalid.reason === "invalid|signal", gatedInvalid.reason)
+check("非法 score → kept=0（无 lexical 命中）", gatedInvalid.kept.length === 0, `kept=${gatedInvalid.kept.length}`)
+check("payload 为空 / 非数组 → kept=0", gateRecallResults(null).kept.length === 0 && gateRecallResults({}).kept.length === 0)
+
+// opts 覆盖：minScore / band / max 可调（测试面；生产走默认常量）
+const tuned = gateRecallResults([lexicalItem("t1", 0.3), lexicalItem("t2", 0.28)], { minScore: 0.29, max: 1 })
+check("opts.minScore 覆盖生效", tuned.kept.length === 1 && tuned.kept[0].score === 0.3, `kept=${tuned.kept.length}`)
+
+// --- renderRecallSection 预算 ----------------------------------------------
+
+const longItems = [0.38, 0.35, 0.32, 0.3].map((score, i) => lexicalItem(`long${i}`, score))
+for (const item of longItems) {
+  item.insight.content = `[preference] 长内容条目：${"配置文件一律用 tabs 缩进，不要空格。".repeat(24)}`
+}
+const renderedLong = renderRecallSection({ kept: longItems.map((item) => ({
+  content: item.insight.content,
+  category: item.insight.category,
+  score: item.score,
+})), total: 12, dropped: 8, padding: 0 })
+const renderedLines = renderedLong.split("\n")
+check("render ≤900 字符", renderedLong.length <= RECALL_SECTION_MAX_CHARS, `len=${renderedLong.length}`)
+check(
+  "render 每行摘录 ≤120 字符",
+  renderedLines.slice(1).every((line) => {
+    const marker = line.indexOf("] ")
+    return marker > 0 && line.length - marker - 2 <= RECALL_EXCERPT_CHARS
+  }),
+  JSON.stringify(renderedLines.map((line) => line.length)),
+)
+check("render 每行 ≤150 字符（4 条 ≈700 预算）", renderedLines.slice(1).every((line) => line.length <= 150))
+check("render 去换行（摘录内无原始换行）", !renderedLong.slice(renderedLong.indexOf("\n") + 1).includes("\n\n"))
+check("render kept 为空 → null", renderRecallSection({ kept: [] }) === null)
+check("render 入参为 null → null", renderRecallSection(null) === null)
+
+// --- compressStatus ------------------------------------------------------------
+
+const statusJson = JSON.stringify({
+  by_category: { fact: 6, insight: 3, preference: 10 },
+  db_size_bytes: 368640,
+  db_path: "/Users/someone/project/others/.mnemon/data/default/mnemon.db",
+  edge_count: 323,
+  total_insights: 19,
+  oplog_count: 62,
+})
+const compressed = compressStatus(statusJson)
+check("compressStatus ≤200 字符", compressed.length <= STATUS_SECTION_MAX_CHARS, `len=${compressed.length}`)
+check("compressStatus 单行", !compressed.includes("\n"))
+check(
+  "compressStatus 含类目计数",
+  compressed.includes("6 facts") && compressed.includes("3 insights") && compressed.includes("10 preferences"),
+  compressed,
+)
+check("compressStatus 含 edges 与库大小", compressed.includes("323 edges") && compressed.includes("360KB"), compressed)
+check("compressStatus 含库名（末两段）", compressed.includes("default/mnemon.db"), compressed)
+const single = compressStatus(JSON.stringify({ by_category: { fact: 1 }, edge_count: 0 }))
+check("单数不加 s / 0 edges 省略", single.includes("1 fact") && !single.includes("1 facts") && !single.includes("0 edges"), single)
+
+// 坏 JSON → 截断兜底，不丢段
+const badJson = `SQLITE_BUSY: database is locked ${"x".repeat(400)}`
+const fallbackText = compressStatus(badJson)
+check("坏 JSON → 原样截断 ≤200 字符", fallbackText.length <= STATUS_SECTION_MAX_CHARS && fallbackText.startsWith("SQLITE_BUSY"), `len=${fallbackText.length}`)
+check("空输出 → 空串（段不注入）", compressStatus("") === "" && compressStatus("   ") === "")
+check("非对象 JSON → 截断兜底", compressStatus("[1,2,3]").length <= STATUS_SECTION_MAX_CHARS)
+
+// --- status 缓存：TTL 内命中不 spawn -----------------------------------------
+
+STATUS_CACHE.clear()
+// 缓存命中路径不调 runMnemon：若它真的 spawn，dataDir 不存在 → 返回 ""，断言即失败。
+STATUS_CACHE.set("/nonexistent/mnemon-root", { ts: Date.now(), text: "cached-status-line" })
+const hit = getStatusSection("/nonexistent/mnemon-root")
+check("status 缓存命中 → 不 spawn", hit.text === "cached-status-line" && hit.source === "cached", JSON.stringify(hit))
+
+STATUS_CACHE.set("/nonexistent/stale-root", { ts: Date.now() - STATUS_TTL_MS - 1, text: "stale-line" })
+const expired = getStatusSection("/nonexistent/stale-root")
+check("TTL 过期 → 不返回旧值并重新 spawn", expired.text !== "stale-line" && expired.source === "spawn", JSON.stringify(expired))
+STATUS_CACHE.clear()
+
+// --- 真实 CLI 输出体积守卫（mnemon 不可用时跳过）------------------------------
+
+const probe = spawnSync("mnemon", ["recall", "mnemon recall gate test", "--limit", "12", "--verbose"], {
+  encoding: "utf8",
+  timeout: 15_000,
+})
+if (probe.error || probe.status !== 0) {
+  check("真实 CLI --limit 12 --verbose 输出 <200KB（跳过：mnemon 不可用）", true)
+} else {
+  const bytes = Buffer.byteLength(probe.stdout || "", "utf8")
+  check("真实 CLI --limit 12 --verbose 输出 <200KB（maxBuffer 守卫）", bytes < 200 * 1024, `bytes=${bytes}`)
+}
+
+// ---------------------------------------------------------------------------
+
+console.log(fail === 0 ? "\nALL PASS" : `\n${fail} FAILED`)
+process.exit(fail === 0 ? 0 : 1)

@@ -71,6 +71,21 @@ function debugLog(prefix, ...args) {
 }
 
 const MAX_RECALL_CHARS = 4000
+// Recall quality gate (task 10-11-mnemon-recall-gate). Measured against this
+// store: scores all cluster in 0.25-0.38 (ceiling 0.38), so no absolute
+// threshold alone filters anything -- hence the combination of floor + band
+// relative to the top score + lexical-signal padding check (gateRecallResults).
+// mnemon recall has no --min-score, so the gate has to live here.
+const RECALL_LIMIT = 12 // oversample, mirrors dsh-mnemon candidateMultiplier=3
+const RECALL_MIN_SCORE = 0.25 // dsh-mnemon lowScoreThreshold
+const RECALL_BAND = 0.15 // drop score < topScore - band (trims the tail)
+const RECALL_MAX = 4 // dsh-mnemon maxMediumResults
+const RECALL_MIN_QCHARS = 6 // below this a query recalls only padding (measured: "删" → 5 padding items)
+const STATUS_TTL_MS = 60_000
+const RECALL_SECTION_MAX_CHARS = 900
+const RECALL_EXCERPT_CHARS = 120
+const STATUS_SECTION_MAX_CHARS = 200
+const RECALL_RETRY_MS = 150
 const MARKER = "<mnemon_context>"
 let SETUP_SEQ = 0
 // A 方案的一次性生成入口，setupV2 里按运行时能力赋值（旧版 OpenCode 无 ctx.generate 时为 null）。
@@ -83,7 +98,8 @@ const COMPACTION_TEXT = `## Mnemon Memory
 Before compaction completes, preserve durable preferences, decisions, insights, facts, or context with mnemon remember/link when they will improve future continuity. Do not store secrets, credentials, or short-lived operational noise.`
 
 const USAGE_HINT =
-  "Use mnemon when it materially improves continuity. After responding, decide whether durable preferences, decisions, insights, facts, or context should be stored with mnemon remember/link."
+  "Use mnemon when it materially improves continuity. After responding, decide whether durable preferences, decisions, insights, facts, or context should be stored with mnemon remember/link." +
+  ' The recall above is a shallow pre-filter, not the whole store. For deeper retrieval run mnemon recall "<focused query>" --intent WHY|WHEN|ENTITY --limit 10 --verbose.'
 
 function resolveProjectDataDir(cwd) {
   if (typeof cwd !== "string" || cwd === "") return null
@@ -335,18 +351,229 @@ function buildDocsSection(root, query, budget) {
 }
 
 function buildRecallContext(query, cwd) {
-  const status = runMnemon(["status"], { cwd })
-  const recall = query.trim() === "" ? "" : runMnemon(["recall", query, "--limit", "5"], { cwd })
-  const sections = []
-  if (status) sections.push(`Status:\n${status}`)
-  if (recall) sections.push(`Relevant recall:\n${recall.slice(0, MAX_RECALL_CHARS)}`)
+  const started = Date.now()
   const root = resolveMemoryRoot(cwd)
-  const docs = buildDocsSection(root, query, DOCS_MAX_SECTION_CHARS)
+  const sections = []
+
+  const status = getStatusSection(root)
+  if (status.text) sections.push(`Status:\n${status.text}`)
+
+  // Recall gate stats, emitted as one greppable debug line below so "the gate
+  // fired" is proven from the log, not inferred from a missing section.
+  let kept = 0
+  let dropped = 0
+  let padding = 0
+  let reason = "ok"
+  let recallChars = 0
+  const text = typeof query === "string" ? query : ""
+  if (!recallEnabled()) {
+    reason = "recall-disabled"
+  } else if (!gateQuery(text)) {
+    reason = "short-query"
+    sections.push("(short message — recall skipped)")
+  } else {
+    const payload = runRecall(text, cwd)
+    if (!payload) {
+      reason = "empty|parse"
+      debugLog("mnemon-auto", "recall gate: skipped reason=empty|parse")
+    } else {
+      const gated = gateRecallResults(payload)
+      kept = gated.kept.length
+      dropped = gated.dropped
+      padding = gated.padding
+      reason = gated.reason
+      const rendered = renderRecallSection(gated)
+      if (rendered) {
+        sections.push(rendered)
+        recallChars = rendered.length
+      } else {
+        // R4: an empty recall still leaves the on-demand retrieval hint, not a blank.
+        sections.push(`(no confident match — run mnemon recall "${clipLine(text, 100)}" --intent WHY|WHEN|ENTITY yourself)`)
+      }
+    }
+  }
+
+  const docs = buildDocsSection(root, text, DOCS_MAX_SECTION_CHARS)
   if (docs) sections.push(docs)
   const runtime = buildRuntimeSection(root, MAX_RUNTIME_SECTION_CHARS - docs.length)
   if (runtime) sections.push(runtime)
   sections.push(USAGE_HINT)
-  return `\n\n<mnemon_context>\n${sections.join("\n\n")}\n</mnemon_context>\n\n`
+  const injected = `\n\n<mnemon_context>\n${sections.join("\n\n")}\n</mnemon_context>\n\n`
+  debugLog(
+    "mnemon-auto",
+    `recall gate: kept=${kept} dropped=${dropped} padding=${padding} reason=${reason} ms=${Date.now() - started} chars=${injected.length} status=${status.source} statusChars=${status.text ? status.text.length + "Status:\n".length : 0} recallChars=${recallChars} total=${injected.length}`,
+  )
+  return injected
+}
+
+// ---------------------------------------------------------------------------
+// Recall 质量闸门（task 10-11）：纯函数 + spawn 接线
+// ---------------------------------------------------------------------------
+
+// Process-level A/B switch. Only the recall section is gated off; status,
+// docs, runtime, and the hint stay (README Switches table documents this).
+function recallEnabled() {
+  return process.env.MNEMON_RECALL !== "0"
+}
+
+// Non-whitespace character count. Single-char messages ("删") and fillers
+// ("继续") measured zero evidence hits in this store, so they skip the spawn.
+function gateQuery(query) {
+  if (typeof query !== "string") return false
+  return query.replace(/\s+/g, "").length >= RECALL_MIN_QCHARS
+}
+
+// `recall --verbose` items look like { insight: {...}, score, intent, via,
+// signals }; accept a bare insight object too so shape drift degrades instead
+// of breaking. lexical = keyword+entity+similarity: the only measured signal
+// that separates a real hit from graph/temporal padding.
+function normalizeRecallItem(item) {
+  if (!item || typeof item !== "object") return null
+  const insight = item.insight && typeof item.insight === "object" ? item.insight : item
+  const signals = item.signals && typeof item.signals === "object" ? item.signals : null
+  const lexical = signals
+    ? (Number(signals.keyword) || 0) + (Number(signals.entity) || 0) + (Number(signals.similarity) || 0)
+    : 0
+  const rawScore = item.score
+  const score = Number(rawScore)
+  return {
+    content: typeof insight.content === "string" ? insight.content : "",
+    category: typeof insight.category === "string" && insight.category !== "" ? insight.category : "insight",
+    score,
+    scoreValid: rawScore !== null && rawScore !== undefined && rawScore !== "" &&
+      Number.isFinite(score) && score <= 1,
+    padding: lexical === 0,
+  }
+}
+
+// Three-layer gate (design §3): invalid score → absolute floor → band relative
+// to the top score → lexical-signal padding check. Scores alone cannot tell an
+// 0.30 padding item from an 0.31 hit; the signals can.
+function gateRecallResults(payload, opts = {}) {
+  const max = Number.isInteger(opts.max) && opts.max > 0 ? opts.max : RECALL_MAX
+  const band = Number.isFinite(opts.band) ? opts.band : RECALL_BAND
+  const minScore = Number.isFinite(opts.minScore) ? opts.minScore : RECALL_MIN_SCORE
+  const rawItems = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.results)
+      ? payload.results
+      : Array.isArray(payload?.insights)
+        ? payload.insights
+        : []
+  const reasons = { invalid: 0, score: 0, band: 0, signal: 0 }
+  const candidates = []
+  for (const raw of rawItems) {
+    const item = normalizeRecallItem(raw)
+    if (!item || !item.scoreValid) {
+      reasons.invalid++
+      continue
+    }
+    if (item.score < minScore) {
+      reasons.score++
+      continue
+    }
+    candidates.push(item)
+  }
+  candidates.sort((a, b) => b.score - a.score)
+  const topScore = candidates.length > 0 ? candidates[0].score : NaN
+  const inBand = []
+  for (const item of candidates) {
+    if (item.score < topScore - band) reasons.band++
+    else inBand.push(item)
+  }
+  const paddingCount = inBand.filter((item) => item.padding).length
+  const lexicalHits = inBand.filter((item) => !item.padding)
+  // All padding (graph/temporal neighbours only): keep nothing rather than
+  // shipping noise -- the whole point of the gate.
+  const kept = lexicalHits.length > 0 ? lexicalHits.slice(0, max) : []
+  reasons.signal = inBand.length - kept.length
+  const dropped = reasons.invalid + reasons.score + reasons.band + reasons.signal
+  const reason = ["invalid", "score", "band", "signal"].filter((key) => reasons[key] > 0).join("|")
+  return { kept, dropped, padding: paddingCount, topScore, total: rawItems.length, reason: reason || "none" }
+}
+
+// Compact lines, never the raw CLI JSON: the full --verbose payload (~30KB at
+// limit 12) stays in the parse layer; only the cheap conclusion reaches the model.
+function renderRecallSection(gated) {
+  const kept = Array.isArray(gated?.kept) ? gated.kept : []
+  if (kept.length === 0) return null
+  const total = Number.isInteger(gated?.total) ? gated.total : kept.length
+  const lines = [`Relevant recall (${kept.length}/${total} kept, scores are weak evidence):`]
+  let used = lines[0].length + 1
+  for (const item of kept) {
+    const excerpt = clipLine(item.content, RECALL_EXCERPT_CHARS)
+    if (excerpt === "") continue
+    const score = Number.isFinite(item.score) ? item.score.toFixed(2) : "?"
+    const category = typeof item.category === "string" && item.category !== "" ? item.category : "insight"
+    const line = `— [${score}·${category}] ${excerpt}`
+    if (used + line.length + 1 > RECALL_SECTION_MAX_CHARS) break
+    lines.push(line)
+    used += line.length + 1
+  }
+  return lines.length > 1 ? lines.join("\n") : null
+}
+
+// `mnemon status` JSON → one compact line (category counts + edges + store
+// size + db name). Parse failure falls back to the raw text truncated to the
+// budget: the section degrades, it never disappears on an error.
+function compressStatus(jsonText) {
+  const raw = typeof jsonText === "string" ? jsonText.trim() : ""
+  if (raw === "") return ""
+  const fallback = () => clipLine(raw, STATUS_SECTION_MAX_CHARS)
+  let doc
+  try {
+    doc = JSON.parse(raw)
+  } catch {
+    return fallback()
+  }
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return fallback()
+  const parts = []
+  const byCategory = doc.by_category && typeof doc.by_category === "object" ? doc.by_category : {}
+  for (const [name, count] of Object.entries(byCategory)) {
+    const value = Number(count)
+    if (Number.isFinite(value) && value > 0) parts.push(`${value} ${name}${value === 1 ? "" : "s"}`)
+  }
+  const edges = Number(doc.edge_count)
+  if (Number.isFinite(edges) && edges > 0) parts.push(`${edges} edges`)
+  const bytes = Number(doc.db_size_bytes)
+  if (Number.isFinite(bytes) && bytes > 0) parts.push(`${Math.max(1, Math.round(bytes / 1024))}KB`)
+  const dbPath = typeof doc.db_path === "string" ? doc.db_path : ""
+  if (dbPath !== "") parts.push(dbPath.split(/[\\/]/).filter(Boolean).slice(-2).join("/"))
+  if (parts.length === 0) return fallback()
+  return clipLine(parts.join(" · "), STATUS_SECTION_MAX_CHARS)
+}
+
+// Status changes slowly; paying a spawn per message for it was pure waste.
+// Keyed by memory root because one OpenCode server serves every project.
+const STATUS_CACHE = new Map()
+
+function getStatusSection(root) {
+  const cached = STATUS_CACHE.get(root)
+  if (cached && Date.now() - cached.ts < STATUS_TTL_MS) return { text: cached.text, source: "cached" }
+  // A failed spawn caches the empty string too: one spawn per TTL, never one per message.
+  const status = compressStatus(runMnemon(["status"], { dataDir: root }))
+  STATUS_CACHE.set(root, { ts: Date.now(), text: status })
+  return { text: status, source: "spawn" }
+}
+
+// Oversample with signals so the gate has something to judge. The full JSON
+// only feeds JSON.parse, never the model. Empty or unparseable output
+// (observed: `SQLITE_BUSY: database is locked`) gets one retry, then null --
+// the caller drops the section; injection never fails.
+function runRecall(query, cwd) {
+  const args = ["recall", query, "--limit", String(RECALL_LIMIT), "--verbose"]
+  const parse = (output) => {
+    if (typeof output !== "string" || output.trim() === "") return null
+    try {
+      return JSON.parse(output)
+    } catch {
+      return null
+    }
+  }
+  const first = parse(runMnemon(args, { cwd }))
+  if (first !== null) return first
+  sleep(RECALL_RETRY_MS)
+  return parse(runMnemon(args, { cwd }))
 }
 
 async function resolveSessionCwd(ctx, sessionID, fallback) {
