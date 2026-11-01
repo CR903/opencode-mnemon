@@ -436,8 +436,9 @@ function normalizeRecallItem(item) {
     : 0
   const rawScore = item.score
   const score = Number(rawScore)
+  const content = typeof insight.content === "string" ? insight.content : ""
   return {
-    content: typeof insight.content === "string" ? insight.content : "",
+    content,
     category: typeof insight.category === "string" && insight.category !== "" ? insight.category : "insight",
     score,
     scoreValid: rawScore !== null && rawScore !== undefined && rawScore !== "" &&
@@ -460,7 +461,7 @@ function gateRecallResults(payload, opts = {}) {
       : Array.isArray(payload?.insights)
         ? payload.insights
         : []
-  const reasons = { invalid: 0, score: 0, band: 0, signal: 0 }
+  const reasons = { invalid: 0, score: 0, band: 0, signal: 0, dedup: 0 }
   const candidates = []
   for (const raw of rawItems) {
     const item = normalizeRecallItem(raw)
@@ -483,12 +484,30 @@ function gateRecallResults(payload, opts = {}) {
   }
   const paddingCount = inBand.filter((item) => item.padding).length
   const lexicalHits = inBand.filter((item) => !item.padding)
+  // 内容去重：同一记忆可能以多条重复记录命中（同源 content 多 ID，文本有
+  // 细微差异如首行空格/换行），用规范化键（去分类前缀、压缩空白、取前 100
+  // 字符）只保留最高分那条，避免同一段内容在上下文里出现两次。
+  const seen = new Set()
+  const deduped = lexicalHits.filter((item) => {
+    const key = item.content
+      .replace(/^\s*\[[a-z]+\]\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 100)
+    if (seen.has(key)) {
+      reasons.dedup++
+      return false
+    }
+    seen.add(key)
+    return true
+  })
   // All padding (graph/temporal neighbours only): keep nothing rather than
   // shipping noise -- the whole point of the gate.
-  const kept = lexicalHits.length > 0 ? lexicalHits.slice(0, max) : []
-  reasons.signal = inBand.length - kept.length
-  const dropped = reasons.invalid + reasons.score + reasons.band + reasons.signal
-  const reason = ["invalid", "score", "band", "signal"].filter((key) => reasons[key] > 0).join("|")
+  const kept = deduped.length > 0 ? deduped.slice(0, max) : []
+  // signal = 词法 padding 丢弃 + cap 截断（去重已单独计为 dedup）。
+  reasons.signal = paddingCount + Math.max(0, deduped.length - max)
+  const dropped = reasons.invalid + reasons.score + reasons.band + reasons.signal + reasons.dedup
+  const reason = ["invalid", "score", "band", "signal", "dedup"].filter((key) => reasons[key] > 0).join("|")
   return { kept, dropped, padding: paddingCount, topScore, total: rawItems.length, reason: reason || "none" }
 }
 

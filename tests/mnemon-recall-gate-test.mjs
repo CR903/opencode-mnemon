@@ -55,6 +55,15 @@ const lexicalItem = (id, score, category = "preference", signals = { keyword: 2,
   signals,
 })
 
+// 重复内容：同一 content 以两条记录命中（同内容多 ID），只应保留最高分那条。
+const duplicateItem = (id, score, sharedContent) => ({
+  insight: insight(id, sharedContent, "fact"),
+  score,
+  intent: "WHY",
+  via: "keyword",
+  signals: { keyword: 2, entity: 1, similarity: 0.4, graph: 0 },
+})
+
 // --- 常量与 design.md §3 一致性 --------------------------------------------
 
 check("RECALL_MIN_SCORE=0.25", RECALL_MIN_SCORE === 0.25, String(RECALL_MIN_SCORE))
@@ -132,6 +141,29 @@ const bandPayload = [lexicalItem("h1", 0.9), lexicalItem("h2", 0.8), lexicalItem
 const gatedBand = gateRecallResults(bandPayload)
 check("相对带 → 0.5 < 0.9-0.15 被 drop", gatedBand.kept.length === 2 && gatedBand.dropped === 1, `kept=${gatedBand.kept.length} dropped=${gatedBand.dropped}`)
 check("相对带 → reason=band", gatedBand.reason === "band", gatedBand.reason)
+
+// --- 内容去重：同 content 多 ID 只保留最高分 ----------------------------------
+
+const sharedContent = "本仓库配置文件一律用 tabs 缩进，不要空格。"
+const dupPayload = [
+  duplicateItem("d1", 0.38, sharedContent),
+  duplicateItem("d2", 0.31, sharedContent),
+  lexicalItem("x1", 0.28),
+]
+const gatedDup = gateRecallResults(dupPayload)
+check("内容去重 → kept 只含最高分重复项", gatedDup.kept.length === 2, `kept=${gatedDup.kept.length}`)
+check("内容去重 → 高分段保留", gatedDup.kept[0].score === 0.38, `scores=${gatedDup.kept.map(i => i.score).join(",")}`)
+
+// 同源内容但有细微差异（前缀/空白不同，差异在 100 字符键之后）→ 规范化键仍能去重
+const longBase = "刚更新了trellis，然发现本项目的插件报错了，请帮我修复。顺便问个问题，看别的项目每次会话中问一句话都会去加载trellis 的session-context，context-state，trellis-workflow。"
+const nearDupPayload = [
+  duplicateItem("n1", 0.40, `[fact] ${longBase}\n用户：${longBase}\n要点：第一份。`),
+  duplicateItem("n2", 0.35, `[fact]${longBase}\n用户：${longBase}\n要点：第二份，细节不同。`),
+  lexicalItem("x2", 0.26),
+]
+const gatedNearDup = gateRecallResults(nearDupPayload)
+check("近重复内容 → 规范化去重", gatedNearDup.kept.length === 2, `kept=${gatedNearDup.kept.length}`)
+check("近重复内容 → 保留高分", gatedNearDup.kept[0].score === 0.4, `scores=${gatedNearDup.kept.map(i => i.score).join(",")}`)
 
 // --- score 合法性 -----------------------------------------------------------
 

@@ -46,14 +46,27 @@ These are load-bearing. Breaking them corrupts shared state.
 
 ## Deployment model
 
-One real file, symlinked into the OpenCode plugin slot — so editing the repo edits what OpenCode loads and nothing can drift.
+**推荐：从 npm 安装**。在全局 `~/.config/opencode/opencode.json` 的 `plugins` 数组声明发布包，由 OpenCode 自动拉取：
 
-```sh
-npm run deploy            # ~/.config/opencode/plugins/mnemon.js -> ../opencode-mnemon/mnemon.js
-npm run deploy -- --copy  # force a real copy instead
+```json
+{
+  "plugins": [
+    { "package": "opencode-mnemon" }
+  ]
+}
 ```
 
-The deploy script never leaves the slot momentarily empty: the new link is created at a temp path and swapped in with `rename()`.
+OpenCode 会从 npm 安装到本地缓存（`~/.cache/opencode/npm/opencode-mnemon@latest/`），`opencode plugin list` 应看到 `mnemon` 插件。
+
+**本地回退（不使用 npm 声明的环境）**：用仓库脚本复制到插件槽——注意是**复制**不是符号链接（R11 教训：仓库改名会让符号链接悬空、插件静默失效）。
+
+```sh
+npm run deploy                  # ~/.config/opencode/plugins/mnemon.js <- 仓库 mnemon.js（原子替换）
+npm run deploy -- --check       # 只比对哈希，不写；漂移非零退出
+npm run deploy -- --dry-run     # 打印将要做什么，不写
+```
+
+`deploy --check` 的退出码：`0` 同步 / `1` 漂移或源不可读 / `2` 从未部署。测试和 CI 可据此判断是否真的部署过，避免把"本机未部署"误判成"漂移失败"。
 
 ## Testing
 
