@@ -22,6 +22,7 @@
 	],
 	"main": "./mnemon.js",
 	"bin": {
+		"opencode-mnemon": "./bin/init.mjs",
 		"opencode-mnemon-init": "./bin/init.mjs"
 	},
 	"exports": {

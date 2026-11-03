@@ -112,8 +112,9 @@ npm run deploy -- --dry-run     # 打印将要做什么，不写
 
 ```sh
 cd <project>
-npx opencode-mnemon-init         # 在 cwd 建 .mnemon/
-npx opencode-mnemon-init <dir>   # 或指向别的目录
+npx opencode-mnemon         # 在 cwd 建 .mnemon/
+npx opencode-mnemon <dir>   # 或指向别的目录
+# 旧别名 npx -p opencode-mnemon opencode-mnemon-init 仍可用
 ```
 
 它创建 `runtime/`、`documents/{active,archived,index.json}`（空库写 `{"documents": []}`，已有不覆盖）和目录内 `.gitignore`（只忽略机器本地的 `data/` + `runtime/`，`documents/` 照常可版本化），最后用 `mnemon --data-dir … status` 证明 CLI 可达并预建 sqlite。幂等：已存在的文件一律保留。

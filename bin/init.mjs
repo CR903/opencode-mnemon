@@ -17,7 +17,7 @@
  * trips OpenCode's "Duplicate plugin ID: mnemon" and blocks `plugin update`),
  * and the project root `.gitignore` (scoping lives in `.mnemon/.gitignore`).
  *
- * Usage: npx opencode-mnemon-init [project-dir]
+ * Usage: npx opencode-mnemon [project-dir]
  */
 
 import { spawnSync } from "node:child_process"
@@ -30,7 +30,7 @@ const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"))
 
 const args = process.argv.slice(2)
 if (args.includes("--help") || args.includes("-h")) {
-  console.log(`opencode-mnemon-init v${pkg.version}\n\nUsage: opencode-mnemon-init [project-dir]\n\nScaffolds <project-dir>/.mnemon/ (default: cwd). Idempotent: existing\nfiles are never overwritten. Never touches .opencode/ or the root .gitignore.`)
+  console.log(`opencode-mnemon-init v${pkg.version}\n\nUsage: opencode-mnemon [project-dir]\n\nScaffolds <project-dir>/.mnemon/ (default: cwd). Idempotent: existing\nfiles are never overwritten. Never touches .opencode/ or the root .gitignore.`)
   process.exit(0)
 }
 if (args.includes("--version") || args.includes("-V")) {

@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const INIT = resolve(join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "init.mjs"))
+const PKG = JSON.parse(readFileSync(resolve(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json")), "utf8"))
 
 let fail = 0
 const check = (name, cond, extra = "") => {
@@ -47,6 +48,12 @@ const r4 = run(proj)
 check("exit stays 0 with legacy copy present", r4.status === 0)
 check("warns about Duplicate plugin ID", (r4.stdout + r4.stderr).includes("Duplicate plugin ID"))
 check("does not delete the legacy copy itself", existsSync(join(proj, ".opencode", "plugins", "mnemon.js")))
+
+// --- package bin wiring: npx <pkg> must resolve (bin name == package name) ----
+check("bin exposes package-name entry", PKG.bin?.["opencode-mnemon"] === "./bin/init.mjs")
+for (const target of Object.values(PKG.bin ?? {})) {
+  check(`bin target exists: ${target}`, existsSync(resolve(join(dirname(fileURLToPath(import.meta.url)), "..", target))))
+}
 
 // --- help / version ------------------------------------------------------------
 const rh = spawnSync("node", [INIT, "--help"], { encoding: "utf8" })
