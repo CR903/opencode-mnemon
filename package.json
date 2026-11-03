@@ -21,11 +21,15 @@
 		"recall"
 	],
 	"main": "./mnemon.js",
+	"bin": {
+		"opencode-mnemon-init": "./bin/init.mjs"
+	},
 	"exports": {
 		".": "./mnemon.js"
 	},
 	"files": [
 		"mnemon.js",
+		"bin/",
 		"README.md",
 		"README.zh-CN.md",
 		"LICENSE"
@@ -37,8 +41,8 @@
 		"sync:docs": "node scripts/sync-docs.mjs",
 		"sync:docs:check": "node scripts/sync-docs.mjs --check",
 		"test:build": "sh tests/build-mnemon-test.sh",
-		"test": "sh tests/build-mnemon-test.sh && node scripts/sync-docs.mjs --check && node tests/mnemon-recall-gate-test.mjs && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
-		"test:deploy": "sh tests/build-mnemon-test.sh \"$PWD/mnemon.js\" && node scripts/sync-docs.mjs --check && node tests/mnemon-recall-gate-test.mjs && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs",
+		"test": "sh tests/build-mnemon-test.sh && node scripts/sync-docs.mjs --check && node tests/mnemon-recall-gate-test.mjs && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs && node tests/mnemon-init-test.mjs",
+		"test:deploy": "sh tests/build-mnemon-test.sh \"$PWD/mnemon.js\" && node scripts/sync-docs.mjs --check && node tests/mnemon-recall-gate-test.mjs && node tests/mnemon-extract-test.mjs && node tests/mnemon-remember-e2e.mjs && node tests/mnemon-llm-extract-test.mjs && node tests/mnemon-init-test.mjs",
 		"deploy": "node scripts/deploy.mjs",
 		"deploy:check": "node scripts/deploy.mjs --check",
 		"version:patch": "npm version patch",

@@ -2,7 +2,42 @@
 
 基于 [mnemon](https://github.com/dsh) CLI 的 OpenCode 插件，提供**按项目隔离的自动记忆**。
 
-对话回合在运行时被捕获、蒸馏（先规则、LLM 兜底），通过 `mnemon remember` 写回，并在每次用户消息开头重新注入一段经过质量闸门筛选的记忆。无需逐个用户配置：当项目存在 `<cwd>/.mnemon/` 时记忆落在项目本地，否则回退到 `~/.mnemon`。
+对话回合在运行时被捕获、蒸馏（先规则、LLM 兜底），通过 `mnemon remember` 写回，并在每次模型调用前以临时副本形式重新注入一段经过质量闸门筛选的记忆。无需逐个用户配置：当项目存在 `<cwd>/.mnemon/` 时记忆落在项目本地，否则回退到 `~/.mnemon`。
+
+## 安装
+
+前置：`PATH` 上有 mnemon CLI：
+
+```sh
+npm install --global @mnemon-dev/mnemon
+mnemon --version
+```
+
+全局注册一次即可——改 `~/.config/opencode/opencode.json`：
+
+```json
+{
+  "plugins": [
+    "opencode-mnemon"
+  ]
+}
+```
+
+或运行：
+
+```sh
+opencode plugin add opencode-mnemon
+```
+
+然后重启 OpenCode server（插件在启动时加载），验证：
+
+```sh
+opencode plugin list    # mnemon  x.y.z  opencode-mnemon
+```
+
+以后更新：`opencode plugin update opencode-mnemon`，再重启 server。
+
+一份注册、一份拷贝。不要再往插件目录手放 `mnemon.js`，也不要在 npm 包已注册时跑 `mnemon setup --target opencode`——两种都会装出第二个同 id `"mnemon"` 副本，OpenCode 直接报 `Duplicate plugin ID` 中止，所有插件更新都被卡住。
 
 ## 它做什么
 
@@ -52,7 +87,7 @@
 ```json
 {
   "plugins": [
-    { "package": "opencode-mnemon" }
+    "opencode-mnemon"
   ]
 }
 ```
@@ -69,14 +104,30 @@ npm run deploy -- --dry-run     # 打印将要做什么，不写
 
 `deploy --check` 的退出码：`0` 同步 / `1` 漂移或源不可读 / `2` 从未部署。测试和 CI 可据此判断是否真的部署过，避免把"本机未部署"误判成"漂移失败"。
 
+> ⚠️ 二选一：npm 声明和 copy 部署**只能留一个**。两者并存 = 同一个 `"mnemon"` id 注册两次，`plugin update` 直接报 `Duplicate plugin ID` 中止。用了 npm 版就别再 `npm run deploy`。
+
+## 记忆层初始化（给新项目建库）
+
+插件是全局的，记忆库按项目隔离：`<project>/.mnemon/` 存在即用项目库，否则回退全局 `~/.mnemon`。新项目建库：
+
+```sh
+cd <project>
+npx opencode-mnemon-init         # 在 cwd 建 .mnemon/
+npx opencode-mnemon-init <dir>   # 或指向别的目录
+```
+
+它创建 `runtime/`、`documents/{active,archived,index.json}`（空库写 `{"documents": []}`，已有不覆盖）和目录内 `.gitignore`（只忽略机器本地的 `data/` + `runtime/`，`documents/` 照常可版本化），最后用 `mnemon --data-dir … status` 证明 CLI 可达并预建 sqlite。幂等：已存在的文件一律保留。
+
+它**绝不碰** `.opencode/` 和项目根 `.gitignore`。如果项目是老办法（官方 `mnemon setup --target opencode`）建的，残留的 `.opencode/plugins/mnemon.js` / `.opencode/skills/mnemon` 会触发警告——删掉它，它和 npm 包重复注册。
+
 ## 测试
 
 ```sh
-npm test                          # 重建测试副本，然后跑全部四个套件
+npm test                          # 重建测试副本，然后跑全部五个套件
 npm run test:deploy               # 同上，但针对 $PWD/mnemon.js 而不是 live 部署
 ```
 
-套件（共 182 项检查）：
+套件：
 
 | 文件 | 覆盖 |
 |---|---|
@@ -84,6 +135,7 @@ npm run test:deploy               # 同上，但针对 $PWD/mnemon.js 而不是 
 | `tests/mnemon-extract-test.mjs` | 规则抽取：标题、实体、类别、围栏比例、去重 |
 | `tests/mnemon-remember-e2e.mjs` | 真实 `mnemon remember --data-dir` 往返；全局根隔离 |
 | `tests/mnemon-llm-extract-test.mjs` | LLM 开关矩阵、模型目录解析、prompt/解析、超时、静默回退 |
+| `tests/mnemon-init-test.mjs` | 初始化脚手架：全新布局、幂等重跑、显式目录、遗留重复警告、`--help`/`--version` |
 
 测试从 `/tmp/mnemon-test-plugin.mjs` 导入——这是把内部实现附加为导出的插件副本。**编辑后务必运行 `tests/build-mnemon-test.sh`**，否则测的是过期副本。生产文件保持干净的 `{ id, setup, server }` 形状。
 

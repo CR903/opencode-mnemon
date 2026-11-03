@@ -2,7 +2,42 @@
 
 OpenCode plugin for **project-scoped automatic memory** on top of the [mnemon](https://github.com/dsh) CLI.
 
-Conversation turns are captured at runtime, distilled (rules first, LLM as fallback), written back through `mnemon remember`, and a gated slice of memory is re-injected at the start of every user prompt. No per-user setup: memories land in `<cwd>/.mnemon/` when the project has one, and fall back to `~/.mnemon` when it does not.
+Conversation turns are captured at runtime, distilled (rules first, LLM as fallback), written back through `mnemon remember`, and a gated slice of memory is re-injected ephemerally before every model request. No per-user setup: memories land in `<cwd>/.mnemon/` when the project has one, and fall back to `~/.mnemon` when it does not.
+
+## Installation
+
+Prerequisite: the mnemon CLI on `PATH`:
+
+```sh
+npm install --global @mnemon-dev/mnemon
+mnemon --version
+```
+
+Register the plugin once, globally — either edit `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugins": [
+    "opencode-mnemon"
+  ]
+}
+```
+
+or run:
+
+```sh
+opencode plugin add opencode-mnemon
+```
+
+Then restart the OpenCode server (plugins load at startup) and verify:
+
+```sh
+opencode plugin list    # mnemon  x.y.z  opencode-mnemon
+```
+
+Later updates: `opencode plugin update opencode-mnemon`, then restart the server.
+
+One registration, one copy. Do NOT also drop `mnemon.js` into a plugins directory, and do NOT run `mnemon setup --target opencode` while the npm package is registered — both install a second copy under the same plugin id `"mnemon"` and OpenCode aborts with `Duplicate plugin ID`, blocking all plugin updates.
 
 ## What it does
 
@@ -52,7 +87,7 @@ These are load-bearing. Breaking them corrupts shared state.
 ```json
 {
   "plugins": [
-    { "package": "opencode-mnemon" }
+    "opencode-mnemon"
   ]
 }
 ```
@@ -69,14 +104,30 @@ npm run deploy -- --dry-run     # 打印将要做什么，不写
 
 `deploy --check` 的退出码：`0` 同步 / `1` 漂移或源不可读 / `2` 从未部署。测试和 CI 可据此判断是否真的部署过，避免把"本机未部署"误判成"漂移失败"。
 
+> ⚠️ 二选一：npm 声明和 copy 部署**只能留一个**。两者并存 = 同一个 `"mnemon"` id 注册两次，`plugin update` 直接报 `Duplicate plugin ID` 中止。用了 npm 版就别再 `npm run deploy`。
+
+## Per-project memory init（记忆层初始化）
+
+插件是全局的，记忆库按项目隔离：`<project>/.mnemon/` 存在即用项目库，否则回退全局 `~/.mnemon`。新项目建库：
+
+```sh
+cd <project>
+npx opencode-mnemon-init         # 在 cwd 建 .mnemon/
+npx opencode-mnemon-init <dir>   # 或指向别的目录
+```
+
+它创建 `runtime/`、`documents/{active,archived,index.json}`（空库写 `{"documents": []}`，已有不覆盖）和目录内 `.gitignore`（只忽略机器本地的 `data/` + `runtime/`，`documents/` 照常可版本化），最后用 `mnemon --data-dir … status` 证明 CLI 可达并预建 sqlite。幂等：已存在的文件一律保留。
+
+它**绝不碰** `.opencode/` 和项目根 `.gitignore`。如果项目是老办法（官方 `mnemon setup --target opencode`）建的，残留的 `.opencode/plugins/mnemon.js` / `.opencode/skills/mnemon` 会触发警告——删掉它，它和 npm 包重复注册。
+
 ## Testing
 
 ```sh
-npm test                          # rebuild the test copy, then run all four suites
+npm test                          # rebuild the test copy, then run all five suites
 npm run test:deploy               # same, but against $PWD/mnemon.js instead of the live deploy
 ```
 
-Suites (182 checks total):
+Suites:
 
 | File | Coverage |
 |---|---|
@@ -84,6 +135,7 @@ Suites (182 checks total):
 | `tests/mnemon-extract-test.mjs` | Rule extraction: headlines, entities, categories, fence ratio, dedupe |
 | `tests/mnemon-remember-e2e.mjs` | Real `mnemon remember --data-dir` round trip; global-root isolation |
 | `tests/mnemon-llm-extract-test.mjs` | LLM switch matrix, model catalog resolution, prompt/parse, timeout, silent fallback |
+| `tests/mnemon-init-test.mjs` | Init scaffolding: fresh layout, idempotent rerun, explicit dir, legacy-duplicate warning, `--help`/`--version` |
 
 Tests import `/tmp/mnemon-test-plugin.mjs`, a copy of the plugin with internals appended as exports. **Always run `tests/build-mnemon-test.sh` after editing** — otherwise you are testing a stale copy. The production file stays in its clean `{ id, setup, server }` shape.
 
