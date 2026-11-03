@@ -11,7 +11,7 @@
 | 侧 | 触发 | 效果 |
 |---|---|---|
 | **写** | `session.text.ended` | 把回合追加到项目级 runtime 文件，60s 收尾窗口后 claim + 抽取 + `mnemon remember`（异步，SQLite BUSY 退避） |
-| **读** | `prompt` hook（每次用户消息） | 注入质量闸门筛选的召回段 + 缓存的一行状态 + 工作区文档提示 + 最近运行时回合（总计 ≤3000 字符） |
+| **读** | `context` hook（每次模型调用，临时副本） | 注入质量闸门筛选的召回段 + 缓存的一行状态 + 工作区文档提示 + 跨会话运行时回合。空召回时至多带状态行，否则空。`prompt` hook 只做写侧 stash，不改写 `prompt.text`，注入不进历史 |
 
 三层结构，与 dsh-mnemon 对齐：
 
@@ -27,7 +27,8 @@
 `mnemon recall` 没有 `--min-score`，且 `--limit N` 在意图命中 WHY/WHEN/ENTITY 时用图/时间邻居补到 N——所以插件在注入前先做闸门过滤（task 10-11）：
 
 - 少于 6 个非空白字符的消息完全跳过召回（实测「删」/「继续」零证据命中）。
-- 结果过采样（`--limit 12 --verbose`），然后依次过滤：非法或 `>1` 的分数丢弃，`< 0.25` 丢弃，`< topScore − 0.15` 丢弃，`keyword+entity+similarity === 0` 视为 *padding*——只要有词法命中就丢弃 padding。全部都是 padding → 整段省略（只留一行按需检索提示）。
+- 结果过采样（`--limit 12 --verbose`），然后依次过滤：非法或 `>1` 的分数丢弃，`< 0.25` 丢弃，`< topScore − 0.15` 丢弃，`keyword+entity+similarity === 0` 视为 *padding*——只要有词法命中就丢弃 padding。全部都是 padding → 整段省略，连带文档/运行时/提示段一起省略：空召回的一轮至多带缓存的状态行（约 200 字符），状态为空则完全不注入。USAGE_HINT 只在有召回的轮次才配得上它约 330 字符的成本。
+- 同会话的运行时条目默认排除：它们已在模型上下文里，重复是为同一段文本付两次钱。重启、新会话或压缩后自然恢复。`MNEMON_RUNTIME_SCOPE=all` 可恢复旧行为。
 - 保留结果（≤ 4 条）渲染为紧凑行（`— [0.38·preference] excerpt…`，段 ≤ 900 字符）；约 30KB 的 verbose JSON 只喂 `JSON.parse`，绝不进模型上下文。状态段压缩为一行（≤ 200 字符），按记忆根缓存 60s。
 - CLI 输出为空或不可解析（实测 `SQLITE_BUSY`）时 150ms 后重试一次，仍失败则丢弃该段——注入永不失败。
 - 提示告诉模型深度检索是按需的：`mnemon recall "<focused query>" --intent WHY|WHEN|ENTITY --limit 10 --verbose`。
@@ -106,20 +107,24 @@ CI（`.github/workflows/test.yml`）从 npm 安装 `@mnemon-dev/mnemon`——它
 | `MNEMON_LLM_EXTRACT=1` | 进程 | 需重启 |
 | `MNEMON_LLM_EXTRACT=0` | 进程 | 总闸，压过标记文件 |
 | `MNEMON_LLM_MODEL` | 进程 | 压过标记文件的模型内容 |
+| `MNEMON_LLM_MODELS` | 进程 | 逗号分隔 `provider/model`，整体覆盖默认模型链 |
 | `MNEMON_AUTOMEM=0` | 进程 | 写侧关闭；**读侧保持开启** |
-| `MNEMON_RECALL=0` | 进程 | 召回段关闭；状态 / 文档 / 运行时 / 提示保留 |
-| `TRELLIS_HOOKS=0` / `TRELLIS_DISABLE_HOOKS=1` | 进程 | 总闸，**读写两侧都停止** |
+| `MNEMON_RECALL=0` | 进程 | 召回段关闭；注入至多带状态（文档 / 运行时 / 提示都关闭） |
+| `MNEMON_RUNTIME_SCOPE=all` | 进程 | 运行时段包含同会话条目（默认只跨会话） |
+| `MNEMON_DEBUG=0` | 进程 | 插件日志完全关闭 |
+| `MNEMON_DEBUG_LOG=<path>` | 进程 | 覆盖插件日志路径（默认 OS 临时目录 `mnemon-plugin-debug.log`） |
+| `MNEMON_DISABLE=1` | 进程 | 总闸，**读写两侧都停止**（`TRELLIS_HOOKS=0` / `TRELLIS_DISABLE_HOOKS=1` 作 legacy 兼容保留） |
 
 标记文件的非空内容被视为模型 ID。
 
-**环境开关是进程级的。** 每个插件实例都活在后端常驻的 OpenCode *server* 进程里，所以 `TRELLIS_HOOKS=0 opencode run ...` 无效——`opencode run` 是客户端，环境变量到不了 server。请在启动 server 的环境里导出。这也意味着环境开关无法按项目隔离；要按项目用标记文件。
+**环境开关是进程级的。** 每个插件实例都活在后端常驻的 OpenCode *server* 进程里，所以 `MNEMON_DISABLE=1 opencode run ...` 无效——`opencode run` 是客户端，环境变量到不了 server。请在启动 server 的环境里导出。这也意味着环境开关无法按项目隔离；要按项目用标记文件。
 
 ## LLM 模型解析
 
 模型按 live 目录解析，绝不硬编码——硬编码一个不在 `ctx.model.list()` 里的 provider，每次调用都会失败。
 
-- `pickModelRef(models, wanted)` 按 `[configured, ...LLM_MODEL_CHAIN]` 顺序搜索。目录为空 → 信任配置；无匹配 → `null` 并静默放弃。
-- `LLM_MODEL_CHAIN = ["opencode-go/qwen3.8-flash", "opencode-go/deepseek-v4-flash", "opencode-gemini-3.5-flash-lite", "opencode-go/longcat-2.5-preview-free"]`
+- `pickModelRef(models, wanted)` 按 `[configured, ...llmModelChain()]` 顺序搜索。目录为空 → 信任配置；无匹配 → `null` 并静默放弃。
+- 默认链 `["opencode-go/qwen3.8-flash", "opencode-go/deepseek-v4-flash", "opencode-gemini-3.5-flash-lite", "opencode-go/longcat-2.5-preview-free"]`，`MNEMON_LLM_MODELS`（逗号分隔 `provider/model`）可整体覆盖。`LLM_MODEL_CHAIN` 保留作兼容别名。
 - `ctx.model.list()` 返回 `{ location, data }` ——取 `.data`。
 - 模型引用必须是 `{ id, modelID, providerID }` 且 **`id` 必须是裸 modelID**。传完整 `provider/model` 字符串会被重新拼成 `provider/provider/model`。只有 `{ id }` 会报 `Missing key at ["model"]["providerID"]`；裸字符串报 `Expected Model.Ref | null`；省略 `model` 命中免费档，它会拒绝 OpenCode 外部的调用。
 
@@ -149,6 +154,8 @@ CI（`.github/workflows/test.yml`）从 npm 安装 `@mnemon-dev/mnemon`——它
 | `RECALL_LIMIT` / `RECALL_MAX` | 12 / 4 |
 | `RECALL_MIN_SCORE` / `RECALL_BAND` | 0.25 / 0.15 |
 | `RECALL_MIN_QCHARS` | 6 |
+| `MAX_QUERY_CHARS` | 8000 |
+| `RECALL_CACHE_MAX` | 128 |
 | `STATUS_TTL_MS` | 60 000 |
 | `RECALL_SECTION_MAX_CHARS` / `STATUS_SECTION_MAX_CHARS` | 900 / 200 |
 
@@ -156,7 +163,7 @@ CI（`.github/workflows/test.yml`）从 npm 安装 `@mnemon-dev/mnemon`——它
 
 ## 调试
 
-- 插件日志：`/tmp/trellis-plugin-debug.log`，grep `mnemon-auto`（append / remember / `llm extract ok|drop|skipped` / sweep / lease / `recall gate: kept= dropped= padding= reason= ms= chars= status=cached|spawn`）。8MB 轮转到 `.log.1` / `.log.2`，诊断中途轮转也能读上一代。
+- 插件日志：`$TMPDIR/mnemon-plugin-debug.log`（`MNEMON_DEBUG_LOG` 覆盖，`MNEMON_DEBUG=0` 关闭），grep `mnemon-auto`（append / remember / `llm extract ok|drop|skipped` / sweep / lease / `recall gate: kept= dropped= padding= reason= ms= chars= status=cached|spawn` / `context inject`）。8MB 轮转到 `.log.1` / `.log.2`，诊断中途轮转也能读上一代。流式事件不再逐条记日志。
 - 加载日志：`~/.local/share/opencode/log/opencode.log`，`loading plugin` / `failed to load plugin`——原始计数有虚高，用 `grep -av "spawning process"` 过滤。
 
 ## 项目约定

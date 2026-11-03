@@ -1,6 +1,13 @@
 import { spawnSync } from "node:child_process"
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
+  LLM_MODEL_CHAIN,
+  MARKER,
+  MAX_QUERY_CHARS,
   RECALL_BAND,
+  RECALL_CACHE,
   RECALL_EXCERPT_CHARS,
   RECALL_MAX,
   RECALL_MIN_QCHARS,
@@ -9,10 +16,17 @@ import {
   STATUS_CACHE,
   STATUS_SECTION_MAX_CHARS,
   STATUS_TTL_MS,
+  buildRecallContext,
+  buildRuntimeSection,
+  cachedRecallContext,
   compressStatus,
   gateQuery,
   gateRecallResults,
   getStatusSection,
+  hooksDisabled,
+  lastUserMessage,
+  llmModelChain,
+  prependText,
   renderRecallSection,
 } from "/tmp/mnemon-test-plugin.mjs"
 
@@ -264,6 +278,95 @@ if (probe.error || probe.status !== 0) {
   const bytes = Buffer.byteLength(probe.stdout || "", "utf8")
   check("真实 CLI --limit 12 --verbose 输出 <200KB（maxBuffer 守卫）", bytes < 200 * 1024, `bytes=${bytes}`)
 }
+
+// --- 注入不落历史 / 空召回零税 / 同会话运行时去重 / 缓存 / 去耦合 ----------
+// （第 1/2/3/5 处改动的回归守卫；buildRecallContext 在 MNEMON_RECALL=0 时不
+// spawn recall，只走 status 缓存，断言与真实 CLI 无关）
+
+const savedRecallEnv = process.env.MNEMON_RECALL
+process.env.MNEMON_RECALL = "0"
+STATUS_CACHE.clear()
+RECALL_CACHE.clear()
+const emptyCtx = buildRecallContext("这是一条足够长的查询文本用于触发门禁", tmpdir(), "ses-self")
+check("空召回 → 不带 USAGE_HINT", !emptyCtx.includes("Use mnemon when"), `chars=${emptyCtx.length}`)
+check("空召回 → 不带运行时段", !emptyCtx.includes("Recent runtime turns"), `chars=${emptyCtx.length}`)
+check("空召回 → 不带文档段", !emptyCtx.includes("Workspace documents"), `chars=${emptyCtx.length}`)
+check(
+  "空召回 → 至多状态段（≤300 字符）",
+  emptyCtx === "" || (emptyCtx.includes(MARKER) && emptyCtx.length <= 300),
+  `chars=${emptyCtx.length}`,
+)
+if (savedRecallEnv === undefined) delete process.env.MNEMON_RECALL
+else process.env.MNEMON_RECALL = savedRecallEnv
+STATUS_CACHE.clear()
+
+// 同会话运行时条目默认过滤（跨会话保留）
+const rtRoot = mkdtempSync(join(tmpdir(), "mnemon-rt-"))
+mkdirSync(join(rtRoot, "runtime"), { recursive: true })
+writeFileSync(
+  join(rtRoot, "runtime", "opencode-memories.json"),
+  JSON.stringify({
+    version: 1,
+    entries: [
+      { ts: "2026-11-04T00:00:00.000Z", sessionID: "ses-self", user: "本轮问题", assistant: "本轮答复SELF_MARK" },
+      { ts: "2026-11-04T00:00:01.000Z", sessionID: "ses-other", user: "别轮问题", assistant: "别轮答复OTHER_MARK" },
+    ],
+  }),
+)
+const rtSelf = buildRuntimeSection(rtRoot, 2048, "ses-self")
+check("同会话条目被过滤", !rtSelf.includes("SELF_MARK") && rtSelf.includes("OTHER_MARK"), rtSelf.slice(0, 80))
+const rtAll = buildRuntimeSection(rtRoot, 2048, "ses-nobody")
+check("他会话视角保留全部", rtAll.includes("SELF_MARK") && rtAll.includes("OTHER_MARK"))
+const rtNoSid = buildRuntimeSection(rtRoot, 2048)
+check("无 sessionID 时不过滤（兼容旧调用）", rtNoSid.includes("SELF_MARK"))
+
+// 同条消息的工具续跑命中缓存，不再重算
+RECALL_CACHE.clear()
+const q = "缓存查询文本足够长"
+const c1 = cachedRecallContext("ses-cache", "msg-1", q, tmpdir())
+const cacheHit = RECALL_CACHE.get("ses-cache")
+check("首轮写入 RECALL_CACHE", cacheHit?.messageID === "msg-1" && cacheHit?.query === q.slice(0, MAX_QUERY_CHARS))
+const c2 = cachedRecallContext("ses-cache", "msg-1", q, tmpdir())
+check("同消息复用缓存结果", c1 === c2)
+check("RECALL_CACHE 有上限", RECALL_CACHE.size <= 1000)
+RECALL_CACHE.clear()
+
+// lastUserMessage 双形状：V1 parts / V2 content
+const v1 = lastUserMessage({ messages: [{ info: { role: "user", id: "m1", sessionID: "s1" }, parts: [{ type: "text", text: "hello" }] }] })
+check("V1 parts 形状", v1?.text === "hello" && v1?.sessionID === "s1" && v1?.messageID === "m1")
+const v2 = lastUserMessage({ messages: [{ role: "user", id: "m2", content: [{ type: "text", text: "world" }] }] })
+check("V2 content 形状", v2?.text === "world" && v2?.messageID === "m2")
+check("非 user 消息跳过", lastUserMessage({ messages: [{ role: "assistant", parts: [{ type: "text", text: "x" }] }] }) === null)
+const pe = []
+prependText(pe, "   ")
+check("空注入不改 parts", pe.length === 0)
+prependText(pe, "x")
+check("非空注入前插", pe.length === 1 && pe[0].text === "x")
+
+// 总闸去耦合：MNEMON_DISABLE 为主，TRELLIS_* 只作 legacy fallback
+const savedDisable = process.env.MNEMON_DISABLE
+const savedTrellis = process.env.TRELLIS_HOOKS
+delete process.env.MNEMON_DISABLE
+delete process.env.TRELLIS_HOOKS
+check("默认不禁用", hooksDisabled() === false)
+process.env.MNEMON_DISABLE = "1"
+check("MNEMON_DISABLE=1 禁用", hooksDisabled() === true)
+delete process.env.MNEMON_DISABLE
+process.env.TRELLIS_HOOKS = "0"
+check("TRELLIS_HOOKS=0 仍兼容禁用", hooksDisabled() === true)
+if (savedDisable === undefined) delete process.env.MNEMON_DISABLE
+else process.env.MNEMON_DISABLE = savedDisable
+if (savedTrellis === undefined) delete process.env.TRELLIS_HOOKS
+else process.env.TRELLIS_HOOKS = savedTrellis
+
+// 模型链可覆盖，默认链保持导出兼容
+const savedModels = process.env.MNEMON_LLM_MODELS
+delete process.env.MNEMON_LLM_MODELS
+check("默认链等于导出别名", JSON.stringify(llmModelChain()) === JSON.stringify(LLM_MODEL_CHAIN))
+process.env.MNEMON_LLM_MODELS = "foo/bar, baz/qux"
+check("MNEMON_LLM_MODELS 整体覆盖", JSON.stringify(llmModelChain()) === JSON.stringify(["foo/bar", "baz/qux"]))
+if (savedModels === undefined) delete process.env.MNEMON_LLM_MODELS
+else process.env.MNEMON_LLM_MODELS = savedModels
 
 // ---------------------------------------------------------------------------
 

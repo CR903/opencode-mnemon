@@ -45,8 +45,13 @@
 		"version:minor": "npm version minor",
 		"version:major": "npm version major"
 	},
-	"dependencies": {
+	"peerDependencies": {
 		"@opencode/plugin": ">=2.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@opencode/plugin": {
+			"optional": true
+		}
 	},
 	"publishConfig": {
 		"access": "public",

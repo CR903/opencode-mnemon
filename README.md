@@ -11,7 +11,7 @@ Two sides, sharing one mnemon store.
 | Side | Trigger | Effect |
 |---|---|---|
 | **Write** | `session.text.ended` | Append the turn to a per-project runtime file, then after a 60s finalize window claim + extract + `mnemon remember` (async, BUSY backoff) |
-| **Read** | `prompt` hook (every user message) | Inject a quality-gated recall section + cached one-line status + workspace-doc hints + recent runtime turns (≤3000 chars total) |
+| **Read** | `context` hook (every model call, ephemeral) | Inject a quality-gated recall section + cached one-line status + workspace-doc hints + cross-session runtime turns. Empty recall → status line at most, otherwise nothing. The `prompt` hook only stashes the user text for the write side — it never rewrites `prompt.text`, so injection does not accumulate in session history |
 
 Three layers, mirroring dsh-mnemon:
 
@@ -27,7 +27,8 @@ Three layers, mirroring dsh-mnemon:
 `mnemon recall` has no `--min-score`, and `--limit N` pads to N with graph/temporal neighbours when intent auto-detects to WHY/WHEN/ENTITY — so the plugin gates results before injection (task 10-11):
 
 - Messages under 6 non-whitespace characters skip the recall spawn entirely (`删` / `继续` measured zero evidence hits).
-- Results are oversampled (`--limit 12 --verbose`), then filtered in order: invalid or `>1` scores drop, `< 0.25` drops, `< topScore − 0.15` drops, and items with `keyword+entity+similarity === 0` are treated as *padding* — dropped whenever any lexical hit exists. All padding → the whole section is omitted (one on-demand hint line remains).
+- Results are oversampled (`--limit 12 --verbose`), then filtered in order: invalid or `>1` scores drop, `< 0.25` drops, `< topScore − 0.15` drops, and items with `keyword+entity+similarity === 0` are treated as *padding* — dropped whenever any lexical hit exists. All padding → the whole section is omitted, and with it the docs/runtime/hint sections: an empty-recall turn ships the cached status line at most (~200 chars), or nothing when even status is empty. The USAGE_HINT only earns its ~330 chars on turns where something was actually recalled.
+- Same-session runtime entries are excluded by default: they are already in the model's context, and repeating them pays for the same text twice. They return after a restart, in another session, or post-compaction. `MNEMON_RUNTIME_SCOPE=all` restores the old behavior.
 - Kept results (≤ 4) render as compact lines (`— [0.38·preference] excerpt…`, section ≤ 900 chars); the ~30 KB verbose JSON only feeds `JSON.parse`, never the model context. The status section is compressed to one line (≤ 200 chars) and cached 60s per memory root.
 - Empty or unparseable CLI output (observed `SQLITE_BUSY`) retries once after 150ms, then drops the section — injection never fails.
 - The hint tells the model deep retrieval is on demand: `mnemon recall "<focused query>" --intent WHY|WHEN|ENTITY --limit 10 --verbose`.
@@ -106,20 +107,24 @@ CI (`.github/workflows/test.yml`) installs `@mnemon-dev/mnemon` from npm — it 
 | `MNEMON_LLM_EXTRACT=1` | process | restart required |
 | `MNEMON_LLM_EXTRACT=0` | process | master kill, overrides the flag file |
 | `MNEMON_LLM_MODEL` | process | overrides the flag file's model content |
+| `MNEMON_LLM_MODELS` | process | comma-separated `provider/model` list overriding the default model chain |
 | `MNEMON_AUTOMEM=0` | process | write side off; **read side stays on** |
-| `MNEMON_RECALL=0` | process | recall section off; status / docs / runtime / hint stay on |
-| `TRELLIS_HOOKS=0` / `TRELLIS_DISABLE_HOOKS=1` | process | master kill, **both sides stop** |
+| `MNEMON_RECALL=0` | process | recall section off; injection carries status at most (docs / runtime / hint stay off) |
+| `MNEMON_RUNTIME_SCOPE=all` | process | runtime section includes same-session entries (default: cross-session only) |
+| `MNEMON_DEBUG=0` | process | plugin log off entirely |
+| `MNEMON_DEBUG_LOG=<path>` | process | override the plugin log path (default: OS temp dir `mnemon-plugin-debug.log`) |
+| `MNEMON_DISABLE=1` | process | master kill, **both sides stop** (`TRELLIS_HOOKS=0` / `TRELLIS_DISABLE_HOOKS=1` honored as legacy fallback) |
 
 The flag file's non-empty content is treated as a model ID.
 
-**Env switches are process-level.** Every plugin instance lives in the long-running OpenCode *server* process, so `TRELLIS_HOOKS=0 opencode run ...` does nothing — `opencode run` is a client and the env never reaches the server. Export it in the environment that starts the server. This also means env switches cannot be scoped per-project; use the flag file for that.
+**Env switches are process-level.** Every plugin instance lives in the long-running OpenCode *server* process, so `MNEMON_DISABLE=1 opencode run ...` does nothing — `opencode run` is a client and the env never reaches the server. Export it in the environment that starts the server. This also means env switches cannot be scoped per-project; use the flag file for that.
 
 ## LLM model resolution
 
 Models are resolved against the live catalog, never hardcoded — a hardcoded provider that is not in `ctx.model.list()` fails every call.
 
-- `pickModelRef(models, wanted)` searches `[configured, ...LLM_MODEL_CHAIN]` in order. Empty catalog → trust the config; nothing matches → `null` and a silent give-up.
-- `LLM_MODEL_CHAIN = ["opencode-go/qwen3.8-flash", "opencode-go/deepseek-v4-flash", "opencode-gemini-3.5-flash-lite", "opencode-go/longcat-2.5-preview-free"]`
+- `pickModelRef(models, wanted)` searches `[configured, ...llmModelChain()]` in order. Empty catalog → trust the config; nothing matches → `null` and a silent give-up.
+- Default chain is `["opencode-go/qwen3.8-flash", "opencode-go/deepseek-v4-flash", "opencode-gemini-3.5-flash-lite", "opencode-go/longcat-2.5-preview-free"]`, overridable wholesale via `MNEMON_LLM_MODELS` (comma-separated `provider/model`). `LLM_MODEL_CHAIN` remains as an alias for compatibility.
 - `ctx.model.list()` returns `{ location, data }` — take `.data`.
 - The model ref must be `{ id, modelID, providerID }` and **`id` must be the bare modelID**. Passing the full `provider/model` string gets re-joined into `provider/provider/model`. `{ id }` alone fails with `Missing key at ["model"]["providerID"]`; a bare string fails with `Expected Model.Ref | null`. Omitting `model` hits the free tier, which rejects out-of-OpenCode calls.
 
@@ -149,6 +154,8 @@ All of the above was found by probing, not reading docs.
 | `RECALL_LIMIT` / `RECALL_MAX` | 12 / 4 |
 | `RECALL_MIN_SCORE` / `RECALL_BAND` | 0.25 / 0.15 |
 | `RECALL_MIN_QCHARS` | 6 |
+| `MAX_QUERY_CHARS` | 8000 |
+| `RECALL_CACHE_MAX` | 128 |
 | `STATUS_TTL_MS` | 60 000 |
 | `RECALL_SECTION_MAX_CHARS` / `STATUS_SECTION_MAX_CHARS` | 900 / 200 |
 
@@ -156,7 +163,7 @@ All of the above was found by probing, not reading docs.
 
 ## Debugging
 
-- Plugin log: `/tmp/trellis-plugin-debug.log`, grep `mnemon-auto` (append / remember / `llm extract ok|drop|skipped` / sweep / lease / `recall gate: kept= dropped= padding= reason= ms= chars= status=cached|spawn`). Rotates at 8 MB to `.log.1` / `.log.2`, so an investigation can still read the previous generation after a rotation lands mid-diagnosis.
+- Plugin log: `$TMPDIR/mnemon-plugin-debug.log` (override with `MNEMON_DEBUG_LOG`, off with `MNEMON_DEBUG=0`), grep `mnemon-auto` (append / remember / `llm extract ok|drop|skipped` / sweep / lease / `recall gate: kept= dropped= padding= reason= ms= chars= status=cached|spawn` / `context inject`). Rotates at 8 MB to `.log.1` / `.log.2`, so an investigation can still read the previous generation after a rotation lands mid-diagnosis. Per-event streaming traffic is deliberately not logged.
 - Load log: `~/.local/share/opencode/log/opencode.log`, `loading plugin` / `failed to load plugin` — the raw counts are inflated; filter with `grep -av "spawning process"`
 
 ## Project conventions

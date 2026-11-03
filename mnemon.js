@@ -5,16 +5,18 @@
  *   - "shell.env"（MNEMON_OPENCODE=1）
  *     → ctx.shell.hook("create.before")，input.env 可直接改写
  *   - "experimental.chat.messages.transform"（recall 上下文注入）
- *     → ctx.session.hook("prompt")，input.prompt.text 可直接改写；
+ *     → ctx.session.hook("context")，向最后一条 user 消息的 parts unshift；
+ *     context 改写的是发给模型的临时副本，不写入会话历史（prompt hook 只
+ *     stash 写侧配对文本，不再改写 prompt.text，否则注入逐轮累积）。
  *     会话 cwd 经 ctx.session.get 解析（与 open-code-review.ts 的 resolveSessionCwd 同款）
  *   - "experimental.session.compacting"（压缩前记忆提示）
  *     → ctx.session.hook("compaction")，向 input.system 追加 system part
  *   - event "session.idle" 仅打日志，无实质功能，V2 不再订阅
  *     （V2 Context.app 无 log 通道；如需 idle 自动 remember 属于功能增强，另行规划）
  *
- * 兼容性：默认导出同时带 setup（V2）与 server（V1），与
- * open-code-review.ts / herdr-agent-state.js 的双版本模式一致。
- * Mnemon 调用由 Bun.spawnSync 改为 node:child_process，便于 bun/node 双 runtime 加载。
+ * 兼容性：默认导出同时带 setup（V2）与 server（V1），与 OpenCode 官方
+ * mnemon 插件的双版本模式一致。Mnemon 调用使用 node:child_process，便于
+ * bun/node 双 runtime 加载。
  */
 
 import { spawn, spawnSync } from "node:child_process"
@@ -34,9 +36,16 @@ import {
   writeFileSync,
 } from "node:fs"
 import { createRequire } from "node:module"
+import { tmpdir } from "node:os"
 import { basename, dirname, join } from "node:path"
 
-const AUTOMEM_DEBUG_LOG = "/tmp/trellis-plugin-debug.log"
+// A plugin installed by users must not assume a path that only exists on the
+// author's machine: /tmp is absent on Windows and unwritable in some sandboxes.
+// The OS temp dir is the portable default; MNEMON_DEBUG_LOG overrides it.
+const AUTOMEM_DEBUG_LOG = process.env.MNEMON_DEBUG_LOG?.trim() || join(tmpdir(), "mnemon-plugin-debug.log")
+// On by default (the recall gate proves itself from these lines), MNEMON_DEBUG=0
+// turns every write off for users who never read the file.
+const DEBUG_ENABLED = process.env.MNEMON_DEBUG !== "0"
 // Append-only with no bound reached 63 MB, and every debugging session greps
 // this file. Rotate on size, keeping the previous generations for post-mortem
 // context -- a rotation often lands mid-investigation. Generations past
@@ -44,6 +53,10 @@ const AUTOMEM_DEBUG_LOG = "/tmp/trellis-plugin-debug.log"
 // higher-numbered file can only predate a smaller KEEP value.
 const DEBUG_LOG_MAX_BYTES = 8 * 1024 * 1024
 const DEBUG_LOG_KEEP_GENERATIONS = 2
+// statSync fired on every single line (two syscalls per streaming event). Track
+// the bytes we wrote instead and only re-stat when the counter reaches the
+// limit; -1 means "size unknown", the only case that stats up front.
+let debugBytes = -1
 
 function rotateDebugLog() {
   try {
@@ -61,10 +74,18 @@ function rotateDebugLog() {
 }
 
 function debugLog(prefix, ...args) {
+  if (!DEBUG_ENABLED) return
   const line = `[${new Date().toISOString()}] [${prefix}] ${args.map((a) => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ")}\n`
   try {
-    rotateDebugLog()
+    if (debugBytes < 0 || debugBytes > DEBUG_LOG_MAX_BYTES) {
+      debugBytes = statSync(AUTOMEM_DEBUG_LOG, { throwIfNoEntry: false })?.size ?? 0
+      if (debugBytes > DEBUG_LOG_MAX_BYTES) {
+        rotateDebugLog()
+        debugBytes = 0
+      }
+    }
     appendFileSync(AUTOMEM_DEBUG_LOG, line)
+    debugBytes += Buffer.byteLength(line)
   } catch {
     // ignore
   }
@@ -81,12 +102,18 @@ const RECALL_MIN_SCORE = 0.25 // dsh-mnemon lowScoreThreshold
 const RECALL_BAND = 0.15 // drop score < topScore - band (trims the tail)
 const RECALL_MAX = 4 // dsh-mnemon maxMediumResults
 const RECALL_MIN_QCHARS = 6 // below this a query recalls only padding (measured: "删" → 5 padding items)
+const MAX_QUERY_CHARS = 8000 // bounds the text handed to `mnemon recall`; user pastes can be far longer
 const STATUS_TTL_MS = 60_000
 const RECALL_SECTION_MAX_CHARS = 900
 const RECALL_EXCERPT_CHARS = 120
 const STATUS_SECTION_MAX_CHARS = 200
 const RECALL_RETRY_MS = 150
 const MARKER = "<mnemon_context>"
+// Per-request recall cache: OpenCode rebuilds model messages for tool
+// continuations, so one user message can trigger several context hooks.
+// Reuse the recall for the same message instead of re-spawning the CLI.
+const RECALL_CACHE = new Map()
+const RECALL_CACHE_MAX = 128
 let SETUP_SEQ = 0
 // A 方案的一次性生成入口，setupV2 里按运行时能力赋值（旧版 OpenCode 无 ctx.generate 时为 null）。
 let llmGenerate = null
@@ -97,6 +124,8 @@ const COMPACTION_TEXT = `## Mnemon Memory
 
 Before compaction completes, preserve durable preferences, decisions, insights, facts, or context with mnemon remember/link when they will improve future continuity. Do not store secrets, credentials, or short-lived operational noise.`
 
+// The hint is instruction, not memory: it earns its ~330 chars only on turns
+// where something was actually recalled. An empty-recall turn ships nothing.
 const USAGE_HINT =
   "Use mnemon when it materially improves continuity. After responding, decide whether durable preferences, decisions, insights, facts, or context should be stored with mnemon remember/link." +
   ' The recall above is a shallow pre-filter, not the whole store. For deeper retrieval run mnemon recall "<focused query>" --intent WHY|WHEN|ENTITY --limit 10 --verbose.'
@@ -239,6 +268,12 @@ function runMnemonAsync(args, options = {}) {
 
 const MAX_RUNTIME_SECTION_CHARS = 2048
 const RUNTIME_RECENT_COUNT = 5
+// Runtime entries from the session that is asking are already in its context:
+// repeating a compressed copy of the model's own last answer pays for the same
+// text twice. They only carry new information after a restart, in another
+// session, or after compaction -- so cross-session is the default scope.
+// MNEMON_RUNTIME_SCOPE=all restores the old every-entry behaviour.
+const RUNTIME_SCOPE_ALL = process.env.MNEMON_RUNTIME_SCOPE === "all"
 const DOCS_MAX_SECTION_CHARS = 700
 const DOCS_MAX_LIST = 8
 // Below this a hit is usually a coincidental 2-gram (e.g. "协议" in an unrelated doc).
@@ -283,8 +318,15 @@ function readRuntimeEntries(root) {
   }
 }
 
-function buildRuntimeSection(root, budget) {
-  const entries = readRuntimeEntries(root).slice(-RUNTIME_RECENT_COUNT)
+function buildRuntimeSection(root, budget, currentSessionID) {
+  let entries = readRuntimeEntries(root)
+  // Same-session entries are already in the model's context: repeating a
+  // compressed copy of its own last answer pays for the same text twice.
+  // They only help after a restart, in another session, or after compaction.
+  if (!RUNTIME_SCOPE_ALL && typeof currentSessionID === "string" && currentSessionID !== "") {
+    entries = entries.filter((entry) => entry.sessionID !== currentSessionID)
+  }
+  entries = entries.slice(-RUNTIME_RECENT_COUNT)
   if (entries.length === 0 || budget < 80) return ""
   const head = "Recent runtime turns (workspace-scoped, oldest first):"
   const lines = [head]
@@ -350,13 +392,11 @@ function buildDocsSection(root, query, budget) {
   return lines.length > 1 ? lines.join("\n") : ""
 }
 
-function buildRecallContext(query, cwd) {
+function buildRecallContext(query, cwd, sessionID) {
   const started = Date.now()
   const root = resolveMemoryRoot(cwd)
-  const sections = []
-
   const status = getStatusSection(root)
-  if (status.text) sections.push(`Status:\n${status.text}`)
+  const statusSection = status.text ? `Status:\n${status.text}` : ""
 
   // Recall gate stats, emitted as one greppable debug line below so "the gate
   // fired" is proven from the log, not inferred from a missing section.
@@ -365,12 +405,12 @@ function buildRecallContext(query, cwd) {
   let padding = 0
   let reason = "ok"
   let recallChars = 0
+  let rendered = null
   const text = typeof query === "string" ? query : ""
   if (!recallEnabled()) {
     reason = "recall-disabled"
   } else if (!gateQuery(text)) {
     reason = "short-query"
-    sections.push("(short message — recall skipped)")
   } else {
     const payload = runRecall(text, cwd)
     if (!payload) {
@@ -382,20 +422,33 @@ function buildRecallContext(query, cwd) {
       dropped = gated.dropped
       padding = gated.padding
       reason = gated.reason
-      const rendered = renderRecallSection(gated)
-      if (rendered) {
-        sections.push(rendered)
-        recallChars = rendered.length
-      } else {
-        // R4: an empty recall still leaves the on-demand retrieval hint, not a blank.
-        sections.push(`(no confident match — run mnemon recall "${clipLine(text, 100)}" --intent WHY|WHEN|ENTITY yourself)`)
-      }
+      rendered = renderRecallSection(gated)
+      if (rendered) recallChars = rendered.length
     }
   }
 
+  // No confident recall → ship status at most. Docs, runtime and the hint are
+  // the bulk (~2.2KB measured) and earn their bytes only on turns where
+  // something was actually recalled; an empty-recall turn pays ~200 chars
+  // for status, or nothing when even status is empty.
+  if (!rendered) {
+    const sections = []
+    if (statusSection) sections.push(statusSection)
+    const injected = sections.length > 0 ? `\n\n<mnemon_context>\n${sections.join("\n\n")}\n</mnemon_context>\n\n` : ""
+    debugLog(
+      "mnemon-auto",
+      `recall gate: kept=${kept} dropped=${dropped} padding=${padding} reason=${reason} ms=${Date.now() - started} chars=${injected.length} status=${status.source} statusChars=${status.text ? status.text.length + "Status:\n".length : 0} recallChars=${recallChars} total=${injected.length}`,
+    )
+    return injected
+  }
+
+  const sections = []
+  if (statusSection) sections.push(statusSection)
+  sections.push(rendered)
+
   const docs = buildDocsSection(root, text, DOCS_MAX_SECTION_CHARS)
   if (docs) sections.push(docs)
-  const runtime = buildRuntimeSection(root, MAX_RUNTIME_SECTION_CHARS - docs.length)
+  const runtime = buildRuntimeSection(root, MAX_RUNTIME_SECTION_CHARS - docs.length, sessionID)
   if (runtime) sections.push(runtime)
   sections.push(USAGE_HINT)
   const injected = `\n\n<mnemon_context>\n${sections.join("\n\n")}\n</mnemon_context>\n\n`
@@ -410,8 +463,9 @@ function buildRecallContext(query, cwd) {
 // Recall 质量闸门（task 10-11）：纯函数 + spawn 接线
 // ---------------------------------------------------------------------------
 
-// Process-level A/B switch. Only the recall section is gated off; status,
-// docs, runtime, and the hint stay (README Switches table documents this).
+// Process-level A/B switch. Only the recall section is gated off; when recall
+// is empty the injection carries status at most (docs/runtime/hint earn their
+// bytes only on turns where something was actually recalled).
 function recallEnabled() {
   return process.env.MNEMON_RECALL !== "0"
 }
@@ -618,7 +672,7 @@ const MnemonPlugin = async ({ directory, client }) => {
       body: {
         service: "mnemon",
         level: "info",
-        message: "Mnemon OpenCode plugin skipped - TRELLIS_HOOKS disabled",
+        message: "Mnemon OpenCode plugin skipped - memory hooks disabled (MNEMON_DISABLE=1)",
       },
     })
     return {}
@@ -641,7 +695,7 @@ const MnemonPlugin = async ({ directory, client }) => {
       const current = lastUserMessage(output)
       if (!current) return
       if (current.text.includes(MARKER)) return
-      prependText(current.parts, buildRecallContext(current.text, directory))
+      prependText(current.parts, cachedRecallContext(current.sessionID, current.messageID, current.text, directory))
     },
 
     "experimental.session.compacting": async (_input, output) => {
@@ -662,6 +716,24 @@ const MnemonPlugin = async ({ directory, client }) => {
   }
 }
 
+// One user message can trigger several context/transform calls (the tool loop
+// rebuilds the outgoing messages). Reuse the recall for the same message
+// instead of re-spawning the CLI.
+function cachedRecallContext(sessionID, messageID, text, cwd) {
+  const query = typeof text === "string" ? text.slice(0, MAX_QUERY_CHARS) : ""
+  if (typeof sessionID === "string" && sessionID !== "" && messageID) {
+    const cached = RECALL_CACHE.get(sessionID)
+    if (cached && cached.messageID === messageID && cached.query === query) return cached.context
+  }
+  const context = buildRecallContext(query, cwd, sessionID)
+  if (typeof sessionID === "string" && sessionID !== "" && messageID) {
+    RECALL_CACHE.delete(sessionID)
+    RECALL_CACHE.set(sessionID, { messageID, query, context })
+    if (RECALL_CACHE.size > RECALL_CACHE_MAX) RECALL_CACHE.delete(RECALL_CACHE.keys().next().value)
+  }
+  return context
+}
+
 function textFromPart(part) {
   if (!part || typeof part !== "object") return ""
   if (part.type === "text" && typeof part.text === "string") return part.text
@@ -675,8 +747,11 @@ function lastUserMessage(output) {
     const msg = messages[i]
     const role = msg?.info?.role || msg?.role
     if (role !== "user") continue
-    const parts = Array.isArray(msg.parts) ? msg.parts : []
-    return { msg, parts, text: parts.map(textFromPart).filter(Boolean).join("\n") }
+    // V1 transform carries `parts`, the V2 context hook carries `content`.
+    const parts = Array.isArray(msg.parts) ? msg.parts : Array.isArray(msg.content) ? msg.content : []
+    const sessionID = msg?.info?.sessionID ?? msg?.sessionID ?? ""
+    const messageID = msg?.info?.id ?? msg?.id ?? ""
+    return { msg, parts, text: parts.map(textFromPart).filter(Boolean).join("\n"), sessionID, messageID }
   }
   return null
 }
@@ -692,7 +767,7 @@ function prependText(parts, text) {
 
 async function setupV2(ctx) {
   if (hooksDisabled()) {
-    debugLog("mnemon-auto", "setup: skipped - TRELLIS_HOOKS disabled (read + write off)")
+    debugLog("mnemon-auto", "setup: skipped - memory hooks disabled (MNEMON_DISABLE=1, read + write off)")
     return
   }
   // A 方案（步骤 5）：一次性文本生成入口。ctx.generate.text 不经过 session prompt，
@@ -705,8 +780,10 @@ async function setupV2(ctx) {
     input.env.MNEMON_OPENCODE = "1"
   })
 
-  // 2. recall 上下文注入：替代 V1 "experimental.chat.messages.transform"
-  // 同时记录本轮 user 文本，供 text.ended 配对写运行时记忆
+  // 2. 记录本轮 user 文本，供 text.ended 配对写运行时记忆。
+  // 注意：这里只 stash，不做 recall 注入 —— prompt.text 的改写会永久写入
+  // 会话历史（第 N 轮为之前 N-1 轮的注入重复付费）。注入走下面的 context
+  // hook，它改写的是发给模型的临时副本，不留存。
   const setupId = ++SETUP_SEQ
   const lastUserPrompt = new Map()
   await ctx.session.hook("prompt", async (input) => {
@@ -744,18 +821,33 @@ async function setupV2(ctx) {
       "promptKeys:",
       Object.keys(input.prompt ?? {}).join(","),
     )
-    if (text.includes(MARKER)) return
-    const injected = buildRecallContext(userText, cwd)
-    input.prompt.text = injected + userText
-    debugLog(
-      "mnemon-auto",
-      "prompt inject setup:",
-      setupId,
-      "session:",
-      sid,
-      "injectedChars:",
-      injected.length,
-    )
+  })
+
+  // 2b. recall 上下文注入（ephemeral）：替代 V1 "experimental.chat.messages.transform"。
+  // context hook 的 event.messages 是每次模型调用的临时副本，在此 unshift
+  // 不污染会话历史；同条消息的工具续跑命中 RECALL_CACHE，不再 spawn CLI。
+  await ctx.session.hook("context", async (event) => {
+    try {
+      const current = lastUserMessage(event)
+      if (!current) return
+      if (current.text.includes(MARKER)) return
+      const sid = event?.sessionID ?? ""
+      const cwd = await resolveSessionCwd(ctx, sid, ctx.location.directory)
+      const context = cachedRecallContext(sid, current.messageID, current.text, cwd)
+      if (!context) return
+      current.parts.unshift({ type: "text", text: context })
+      debugLog(
+        "mnemon-auto",
+        "context inject setup:",
+        setupId,
+        "session:",
+        sid,
+        "injectedChars:",
+        context.length,
+      )
+    } catch (error) {
+      debugLog("mnemon-auto", "context inject error setup:", setupId, String(error?.message ?? error))
+    }
   })
 
   // 3. 压缩前记忆提示：替代 V1 "experimental.session.compacting"
@@ -1019,14 +1111,21 @@ const LLM_ENABLE_FLAG = "opencode-llm-extract"
 const LLM_ENABLE_ENV = "MNEMON_LLM_EXTRACT"
 const LLM_MODEL_ENV = "MNEMON_LLM_MODEL"
 // ctx.generate.text 要 { id, modelID, providerID } 且必须在模型目录里；"provider/model" 字符串不认，
-// 只给 { id } 会报 Missing key at ["model"]["providerID"]。按顺序取第一个目录里存在的模型，
-// 最后一项是唯一实测可用的兜底（探测确认 opencode-go/longcat-2.5-preview-free 返回 {"text":"OK"}）。
-const LLM_MODEL_CHAIN = [
+// 只给 { id } 会报 Missing key at ["model"]["providerID"]。按顺序取第一个目录里存在的模型。
+// 默认链只是开箱即用的起点；MNEMON_LLM_MODELS（逗号分隔 "provider/model"）可整体覆盖，
+// MNEMON_LLM_MODEL / 标记文件内容可指定首选（仍在链首，失败时逐个降级）。
+const LLM_DEFAULT_CHAIN = [
   "opencode-go/qwen3.8-flash",
   "opencode-go/deepseek-v4-flash",
   "opencode-gemini-3.5-flash-lite",
   "opencode-go/longcat-2.5-preview-free",
 ]
+function llmModelChain() {
+  const override = (process.env.MNEMON_LLM_MODELS ?? "").split(",").map((s) => s.trim()).filter(Boolean)
+  return override.length > 0 ? override : LLM_DEFAULT_CHAIN
+}
+// 旧名保留：测试与外部引用仍可 import LLM_MODEL_CHAIN。
+const LLM_MODEL_CHAIN = LLM_DEFAULT_CHAIN
 const LLM_TIMEOUT_MS = 25_000
 const LLM_SUMMARY_CHARS = REMEMBER_HEADLINE_CHARS
 const LLM_DETAIL_CHARS = REMEMBER_ASSISTANT_CHARS
@@ -1060,9 +1159,11 @@ function autOMEMEnabled() {
   return process.env.MNEMON_AUTOMEM !== "0"
 }
 
-// 与 BalanceDeck 的 session-start / inject-workflow-state / inject-subagent-context 同款总闸。
+// Master kill-switch. MNEMON_DISABLE is the documented name; the TRELLIS_*
+// names are honored as a legacy fallback so existing checkouts keep working.
 // 关掉时读写两侧都不注册；MNEMON_AUTOMEM=0 只关写侧、保留读侧 recall 注入。
 function hooksDisabled() {
+  if (process.env.MNEMON_DISABLE === "1" || process.env.MNEMON_DISABLED === "1") return true
   return process.env.TRELLIS_HOOKS === "0" || process.env.TRELLIS_DISABLE_HOOKS === "1"
 }
 
@@ -1199,7 +1300,7 @@ function modelRefFromName(name) {
 // 目录为空时跳过校验直接信任配置；全都不中返回 null，由调用侧静默放弃。
 function pickModelRef(models, wanted) {
   const list = Array.isArray(models) ? models : []
-  for (const name of [wanted, ...LLM_MODEL_CHAIN]) {
+  for (const name of [wanted, ...llmModelChain()]) {
     if (!name) continue
     const ref = modelRefFromName(name)
     if (!ref) continue
@@ -1520,15 +1621,10 @@ async function consumeSessionEvents(ctx, signal, lastUserPrompt, setupId) {
         }
         continue
       }
-      debugLog(
-        "mnemon-auto",
-        "event:",
-        event?.type ?? "unknown",
-        "session:",
-        data.sessionID ?? data.sessionId ?? "",
-        "keys:",
-        Object.keys(data).join(","),
-      )
+      // Deliberately no per-event logging here: streaming deltas
+      // (session.reasoning.delta / text.delta / tool.* / step.*) fire thousands
+      // of times per session and previously grew the log past 60MB. Errors
+      // below stay; routine traffic does not.
     } catch (error) {
       debugLog("mnemon-auto", "event error:", error?.message ?? String(error))
     }
