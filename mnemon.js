@@ -1131,6 +1131,101 @@ const LLM_SUMMARY_CHARS = REMEMBER_HEADLINE_CHARS
 const LLM_DETAIL_CHARS = REMEMBER_ASSISTANT_CHARS
 const LLM_MAX_ENTITIES = 6
 
+// ---------------------------------------------------------------------------
+// 问答复述 vs 正规业务（T2）：否定信号。extractMemory 是纯肯定式匹配（命中
+// 信号词即收），而技术问答的复述天然富实体，所以执行回执/答疑复述大量漏网。
+// 基线实测（scripts/measure-paraphrase.mjs，25 条 runtime）：kept 20 条里
+// 业务仅 3 条，precision 15%。四层信号按精度从高到低排列：
+//   meta          谈论对话本身（你刚才/好问题/综上…）——几乎不误杀
+//   question-echo 用户在问 + 助手无对话外新实体——答疑复述
+//   overlap       与同会话更早轮次 2-gram 重叠 ≥ 阈值——总结复述
+//   receipt       执行回执式措辞（已提交/验证通过/全绿…）——做完就烂
+// 用户显式留存意图（记住/记一下/…）一票否决：启发式不凌驾于人。
+// ---------------------------------------------------------------------------
+
+// 纯总结话术：只谈论述本身，从不携带新事实。刻意不用"你刚才/你问"——
+// 那是排障结论引用用户刚观测到的症状的合法写法（"你刚才运行的是另一个旧版"）。
+const PARAPHRASE_META = [
+  "好问题", "综上", "如上所述", "上面提到", "本轮", "这次对话",
+  "刚才说的", "总结一下", "总结如下", "换句话说",
+]
+// 显式留存意图：出现即跳过整个 paraphrase 门（T4）。
+const PARAPHRASE_OVERRIDE = ["记住", "记一下", "存一下", "设为", "以后都"]
+// 执行回执措辞：做完即烂。刻意不用 修/修复/创建——那些会出现在真正的排障结论里。
+const PARAPHRASE_RECEIPT = [
+  "已提交", "已推送", "已推到", "已落库", "已存储", "记忆已写入", "已同步",
+  "已发布", "已更新", "验证通过", "全绿", "ALL PASS", "exit=0",
+]
+// 承诺式空话（"I'll 先…再…"）：意图声明本身不是事实，落实后的结论会被
+// 后续轮次重新捕获。约束要狠：无实体且无数字才算，任何带测量值的回答都活。
+const PARAPHRASE_COMMIT = ["I'll", "我来", "我将", "马上就", "这就去"]
+const PARAPHRASE_OVERLAP_THRESHOLD = 0.6 // 基线业务最高 0.47，留出余量
+const PARAPHRASE_QUESTION_RE = /[?？]$|吗$|呢$|如何|为什么|为啥|对比|区别|是什么|怎么|介绍一下/
+
+function paraphraseGrams(text) {
+  const flat = String(text || "").replace(/\s+/g, "")
+  const out = new Set()
+  const capped = flat.slice(0, 2000)
+  for (let i = 0; i + 2 <= capped.length; i++) out.add(capped.slice(i, i + 2))
+  return out
+}
+
+// 同会话更早轮次的助手文本（按 ts，只取过去，不含自己）。
+function sessionSiblings(root, entry) {
+  const all = readRuntimeEntries(root)
+  const sid = entry?.sessionID
+  if (typeof sid !== "string" || sid === "") return []
+  return all
+    .filter(
+      (item) =>
+        item.sessionID === sid &&
+        typeof item.ts === "string" &&
+        typeof entry.ts === "string" &&
+        item.ts <= entry.ts &&
+        item.assistant !== entry.assistant,
+    )
+    .map((item) => item.assistant || "")
+}
+
+function overlapWithSiblings(text, siblings) {
+  const g = paraphraseGrams(stripCodeBlocks(text))
+  if (g.size === 0) return 0
+  const pool = new Set()
+  for (const prior of siblings) for (const x of paraphraseGrams(stripCodeBlocks(prior))) pool.add(x)
+  if (pool.size === 0) return 0
+  let hit = 0
+  for (const x of g) if (pool.has(x)) hit++
+  return hit / g.size
+}
+
+// 返回命中原因（meta|question-echo|overlap|receipt），无命中返回 null。
+function isParaphrase(entry, siblings) {
+  const user = collapseText(entry?.user || "")
+  const assistant = collapseText(entry?.assistant || "")
+  if (user === "" && assistant === "") return null
+  // T4：人说了"记住"，启发式靠边。
+  if (PARAPHRASE_OVERRIDE.some((w) => user.includes(w))) return null
+  if (PARAPHRASE_META.some((w) => assistant.includes(w))) return "meta"
+  if (PARAPHRASE_QUESTION_RE.test(user.trim())) {
+    const userEnt = new Set(extractEntities(user))
+    const asstEnt = extractEntities(`${user}\n${assistant}`)
+    // 助手实体 ⊆ 用户实体 ⇒ 没带来对话外新东西，纯答疑。
+    if (asstEnt.every((e) => userEnt.has(e))) return "question-echo"
+  }
+  if ((siblings || []).length > 0 && overlapWithSiblings(assistant, siblings) >= PARAPHRASE_OVERLAP_THRESHOLD) {
+    return "overlap"
+  }
+  if (PARAPHRASE_RECEIPT.some((w) => assistant.includes(w))) return "receipt"
+  if (
+    PARAPHRASE_COMMIT.some((w) => assistant.includes(w)) &&
+    extractEntities(`${user}\n${assistant}`).length === 0 &&
+    !/\d/.test(assistant)
+  ) {
+    return "commitment"
+  }
+  return null
+}
+
 // Higher entries win; a turn is filed as the strongest signal it carries.
 const REMEMBER_RULES = [
   {
@@ -1237,6 +1332,12 @@ function extractMemory(entry, root) {
   const assistant = collapseText(entry?.assistant || "")
   const rule = classifyMemory(`${user}\n${assistant}`)
   if (!rule || rule.imp < REMEMBER_MIN_IMP) return null
+  // 问答复述不存：否定信号在实体抽取之前，先拦后算。
+  const paraphrase = isParaphrase(entry, sessionSiblings(root, entry))
+  if (paraphrase) {
+    debugLog("mnemon-auto", "remember skip paraphrase:", paraphrase, "session:", entry?.sessionID)
+    return null
+  }
   if (fenceRatio(assistant) > REMEMBER_MAX_FENCE_RATIO) return null
   const total = user.length + assistant.length
   if (total < REMEMBER_MIN_TOTAL_CHARS) return null
@@ -1335,7 +1436,7 @@ function buildLlmPrompt(user, assistant) {
     "",
     "判断标准：",
     "- 值得保存：明确的偏好或决定；踩过的坑与根因结论；环境事实（工具、版本、路径、端口、开关）；后续必须记住的约束。",
-    "- 不值得保存：寒暄与确认；纯执行过程的复述；报错堆栈；没有结论的尝试；重新查证就能拿到的临时状态。",
+    "- 不值得保存：寒暄与确认；纯执行过程的复述；对本轮对话的总结复述（无对话外新事实）；报错堆栈；没有结论的尝试；重新查证就能拿到的临时状态。",
     "",
     "输出要求：只输出一个 JSON 对象，不要代码围栏，不要任何解释。",
     "- 不保存时输出 {\"keep\":false} 。",
@@ -1378,6 +1479,8 @@ async function llmExtractMemory(entry, root) {
   const config = llmExtractConfig(root)
   if (!config || typeof llmGenerate !== "function") return null
   if (!llmWorthyEntry(entry)) return null
+  // 与规则路径同一口径：复述连 LLM 的机会都不给，否则 ?? 兜底形同虚设。
+  if (isParaphrase(entry, sessionSiblings(root, entry))) return null
   const model = pickModelRef(typeof llmCatalog === "function" ? await llmCatalog() : [], config.model)
   if (!model) {
     debugLog("mnemon-auto", "llm extract skipped via:", config.source, "reason: no model resolvable from catalog")

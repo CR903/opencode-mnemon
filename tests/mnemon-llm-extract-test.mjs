@@ -179,6 +179,18 @@ check("派生 key 为 12 位摘要", typeof memo?.key === "string" && memo.key.l
 check("空白实体被过滤", JSON.stringify(memo?.entities) === '["dist-web","dist"]', JSON.stringify(memo?.entities))
 check("标签沿用规则路径", JSON.stringify(memo?.tags) === '["opencode","mnemon-llm-unit"]', JSON.stringify(memo?.tags))
 
+// --- 复述连 LLM 的机会都不给（T3b）：generate 不应被调用 ----------------------
+let paraCalls = 0
+setLlmGenerate(async () => {
+  paraCalls++
+  return { text: '{"keep":true,"cat":"preference","imp":5,"summary":"x","detail":"y","entities":[]}' }
+})
+const paraMemo = await llmExtractMemory(
+  { user: "那官方插件和我们的区别", assistant: "好问题。结论是三层区别：读侧闸门、写侧自动化。" },
+  ROOT,
+)
+check("复述不消耗 LLM", paraMemo === null && paraCalls === 0, `calls=${paraCalls}`)
+
 // --- sweepAndRemember 接线（真实 CLI 写临时库） --------------------------------
 const base = "/tmp/mnemon-llm-e2e"
 const root = `${base}/.mnemon`

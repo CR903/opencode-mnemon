@@ -9,7 +9,9 @@ import {
   extractMemory,
   fenceRatio,
   headlineOf,
+  isParaphrase,
   markRemembered,
+  sessionSiblings,
 } from "/tmp/mnemon-test-plugin.mjs"
 
 let fail = 0
@@ -102,6 +104,84 @@ check("正文结构完整", fac?.content.split("\n").length === 3 && fac?.conten
 check("用户为空时不输出空的用户行", !extractMemory({ ...base, user: "", assistant: "实测这个端点返回 HTTP 200，版本是 0.2.10。" }, root)?.content.includes("用户："))
 check("tags 含项目名", fac?.tags.length === 2 && fac?.tags[1] === basename(projectRoot), JSON.stringify(fac?.tags))
 check("key 为 12 位 hex", /^[0-9a-f]{12}$/.test(fac?.key ?? ""), fac?.key)
+
+// --- 问答复述 vs 正规业务（T2/T3/T4：否定信号 + 用户意图一票否决） --------
+check("meta：谈论对话本身 → 复述", isParaphrase({ user: "官方插件和我们的区别", assistant: "好问题。结论是三层区别：读侧闸门、写侧自动化。" }, []) === "meta")
+check(
+  "question-echo：问句 + 无新实体 → 复述",
+  isParaphrase({ user: "为什么这次没有命中？", assistant: "结论是这次没有命中，因为查询太短。" }, []) === "question-echo",
+)
+check(
+  "question-echo：带来新实体则放行（真排障）",
+  isParaphrase({ user: "为什么报错？", assistant: "实测返回 HTTP 500，根因是 8080 端口被占用，版本 0.2.10。" }, []) === null,
+)
+check(
+  "receipt：执行回执 → 复述",
+  isParaphrase({ user: "把这个提交", assistant: "已提交。远端已推到 f4fc153，标签 v0.2.0，live 插件 hash 一致。" }, []) === "receipt",
+)
+check(
+  "真业务无信号 → 放行",
+  isParaphrase({ user: "跑流程发现很多问题", assistant: "结论是 4 个现象里 3 个是同一个根因：opencode.db 的写入。" }, []) === null,
+)
+check("空轮次 → 放行（无可判）", isParaphrase({ user: "", assistant: "" }, []) === null)
+check(
+  "commitment：空头承诺 → 复述",
+  isParaphrase({ user: "帮我发个版", assistant: "我来处理发布事项，结论是先走版本提交再走远端推送。" }, []) === "commitment",
+)
+check(
+  "commitment：带测量值则放行",
+  isParaphrase({ user: "帮我发个版", assistant: "我来把 0.3.2 发了，结论是先打 tag。" }, []) === null,
+)
+check(
+  "override：用户说记住 → 跳过复述门",
+  isParaphrase({ user: "记住这个结论，以后都按三层区别讲", assistant: "好问题。结论是三层区别：读侧闸门、写侧自动化。" }, []) === null,
+)
+// overlap：与同会话更早轮次高度重合 → 总结复述（基线业务最高 0.47，阈值 0.6 留余量）
+const rtRoot = join(mkdtempSync(join(tmpdir(), "mnemon-paraphrase-")), "proj", ".mnemon")
+mkdirSync(join(rtRoot, "runtime"), { recursive: true })
+const prior = "剥开包装，剩下三层本质区别：读侧的闸门、写侧的自动化、项目层的记忆作用域。官方插件只有最薄的一层。"
+writeFileSync(
+  join(rtRoot, "runtime", "opencode-memories.json"),
+  JSON.stringify({
+    version: 1,
+    entries: [
+      { ts: "2026-11-04T00:00:00.000Z", sessionID: "ses_o", user: "区别是什么", assistant: prior },
+      { ts: "2026-11-04T00:01:00.000Z", sessionID: "ses_o", user: "继续", assistant: `${prior}读侧是直通，写侧靠自觉。` },
+    ],
+  }),
+)
+const cur = { ts: "2026-11-04T00:02:00.000Z", sessionID: "ses_o", user: "继续", assistant: `结论是${prior}读侧是直通。` }
+check("高重叠 → overlap", isParaphrase(cur, sessionSiblings(rtRoot, cur)) === "overlap")
+check(
+  "extractMemory 接入：复述整轮被丢弃",
+  extractMemory({ ...base, user: "那官方插件和我们的区别", assistant: "好问题。结论是三层区别：读侧闸门、写侧自动化。" }, root) === null,
+)
+check(
+  "extractMemory 接入：override 照存",
+  extractMemory(
+    {
+      ...base,
+      user: "记住：以后都按三层区别讲",
+      assistant: "好问题。结论是三层区别：读侧的闸门过滤、写侧的全自动流水线，外加项目层的记忆作用域隔离，三个缺一不可，细节见实现文档。",
+    },
+    root,
+  )?.cat === "preference",
+)
+check(
+  "extractMemory 接入：回执被丢弃",
+  extractMemory({ ...base, user: "把这个提交", assistant: "已提交。远端已推到 f4fc153，验证步骤见上。" }, root) === null,
+)
+check(
+  "extractMemory 接入：空头承诺被丢弃",
+  extractMemory(
+    {
+      ...base,
+      user: "帮我发个版",
+      assistant: "我来处理发布事项。结论是先走版本提交再走远端推送，全流程分三步走，每一步都要先确认再继续推进。",
+    },
+    root,
+  ) === null,
+)
 
 // --- 认领与标记（跨进程语义） ---------------------------------------------
 const tmp = "/tmp/mnemon-claim-test/.mnemon"
